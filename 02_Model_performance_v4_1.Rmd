@@ -1,0 +1,2812 @@
+---
+title: "02 Androgen receptor model performance"
+author: "Todor Antonijevic"
+date: "12/30/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Set working directory
+wd = getwd()
+# Set all code chunks to wd
+knitr::opts_knit$set(root.dir = wd)
+```
+
+```{r}
+wd
+input = paste0(wd,'/inputs')
+output = paste0(wd,'/outputs')
+figures = paste0(wd,'/figures')
+```
+
+```{r}
+# Installs for bioconductor packages as they are not installed using base R #library() function:
+
+pkgs <- installed.packages()
+
+if (!('limma') %in% pkgs) {
+
+  if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+    BiocManager::install("limma")
+}
+
+  
+if (!('ComplexHeatmap') %in% pkgs) {
+
+  if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+    BiocManager::install("ComplexHeatmap")
+}
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(svDialogs)
+library(ComplexHeatmap)
+library(viridis)
+library(circlize)
+library(tcpl)
+library(dplyr)
+library(limma)
+library(stringr)
+library(gRbase)
+library(svglite)
+```
+
+```{r}
+source(paste0(wd,"/R/heatmap_function.R")) # Plotting f-tion.
+```
+
+```{r}
+unix::rlimit_as(161061273600.0, 161061273600.0) # Limit usage to 150 GB
+```
+
+```{r}
+#c_height = dlgInput("Enter a cut height", Sys.info()[""])$res
+c_height = 1
+```
+
+# Read AR data
+
+```{r}
+# GitHub imposes 50MB.
+# File "ALL_supermatrix.csv" is an output of the androgen receptor (AR) model and contains information (area under the curve (AUC)) of agonist and antagonist activity for all models (all subset models and the full model). Be careful with AUC interpretation. It is not a real AUC (for example, evaluated using trapezoidal rule) but a sum.
+# From Judson et al. (2020), "The chemical-assay area under the curve (AUC) values for the assay subset models were estimated using simple linear combinations of individual assay AUC values.". In other words, "simple linear combinations" are sums.
+#ALL = fread(paste0(input, "ALL_supermatrix.csv"))
+ALL = fread(paste0(input, "ALL_supermatrix_antagonist_agonist.csv"))
+CHMS = unique(ALL[,.(code, casrn, name)])
+```
+
+```{r}
+# Bring results for the full model (submodel (or Judson's "amask") "A11111111111111") next to each subset model for easier and faster calculations of different metrics in data.table package.
+ALL_vs_FULL = setorder(merge(x=ALL,y=ALL[submodel == 'A11111111111111',],by=c('code','casrn','name'),all.x = TRUE),by='submodel.x')
+```
+
+```{r}
+rm(ALL)
+```
+
+```{r}
+cat('The total number of chemicals:',length(unique(ALL_vs_FULL$code)),'\n')
+cat('The total number of evaluated subset models:',length(unique(ALL_vs_FULL$submodel.x)),'\n')
+```
+
+```{r}
+# An estimate of the RAM memory usage
+print(object.size(ALL_vs_FULL), units = "Mb")
+dim(ALL_vs_FULL)
+print(object.size(ALL_vs_FULL[,c("code", "casrn", "name", "AUC.Agonist.x", "AUC.Antagonist.x", "submodel.x", "AUC.Agonist.y", "AUC.Antagonist.y","submodel.y")]), units = "Mb")
+```
+
+```{r}
+# We can work only with "code", "casrn", "name", "AUC.Agonist.x", "AUC.Antagonist.x", "submodel.x", "AUC.Agonist.y", "AUC.Antagonist.y", "submodel.y" variables. All other show "interference" values (and hold RAM memory), and they are not of the interest for the project at the time. See comment below.
+# Judson et al. (2020) "The chemical is assigned a mode (agonist, antagonist, other) based on which mode has the largest AUC value, where “other” corresponds to interference via a specific assay or a node in the pathway (Fig. 1). Two key results used from the full model are the AUC(agonist) and the AUC(antagonist). These pathway-level AUC values range from 0 to ~1 and monotonically increase with the log of the potency."
+ALL_vs_FULL = ALL_vs_FULL[,c("code", "casrn", "name", "AUC.Agonist.x", "AUC.Antagonist.x", "submodel.x", "AUC.Agonist.y", "AUC.Antagonist.y","submodel.y")]
+dim(ALL_vs_FULL)
+```
+
+```{r}
+# 1. Calculate sensitivity and specificity metrics across all chemicals
+# In this project, we want to evaluate the results of the subset models against the full model, i.e., how well subset models reproduce the full model. For that purpose, we binarized the AR model outputs according to Judson et al. (2020):
+# "We also dichotomized the subset and full AUC values as follows to obtain a binary active/inactive call. All AUC values less than a cutoff of 0.1 are set to zero, and those at or above 0.1 are set to one. This cutoff corresponds to a potency of ~200 μM, which is the upper limit of testing in any of the in vitro assays (see Supplemental Fig. 1). (In the original full model, an intermediate group of chemicals with AUC in the range from 0.001 to 0.1 were classified as inconclusive, but that rule is not used in this calculation as it would artificially inflate the accuracy of this calculation.)"
+ALL_vs_FULL[,'AUC.Agonist.x.bin' := ifelse(AUC.Agonist.x<0.1,0,1)]
+ALL_vs_FULL[,'AUC.Antagonist.x.bin' := ifelse(AUC.Antagonist.x<0.1,0,1)]
+ALL_vs_FULL[,'AUC.Agonist.y.bin' := ifelse(AUC.Agonist.y<0.1,0,1)]
+ALL_vs_FULL[,'AUC.Antagonist.y.bin' := ifelse(AUC.Antagonist.y<0.1,0,1)]
+```
+
+```{r}
+# Agonist vs. antagonists.
+cat('The number of AR antagonists:',ALL_vs_FULL[submodel.x=='A11111111111111' & AUC.Antagonist.y.bin==1 & AUC.Agonist.y.bin==0,.N],'\n')
+cat('The number of AR agonists:',ALL_vs_FULL[submodel.x=='A11111111111111' & AUC.Antagonist.y.bin==0 & AUC.Agonist.y.bin==1,.N],'\n')
+cat('The number of chemicals that produce both effects:',ALL_vs_FULL[submodel.x=='A11111111111111' & AUC.Agonist.y.bin==1 & AUC.Antagonist.y.bin==1,.N],'\n')
+```
+
+```{r}
+antagonists_AR = unique(ALL_vs_FULL[submodel.x=='A11111111111111' & AUC.Antagonist.y.bin==1 & AUC.Agonist.y.bin==0,code])
+agonists_AR = unique(ALL_vs_FULL[submodel.x=='A11111111111111' & AUC.Antagonist.y.bin==0 & AUC.Agonist.y.bin==1,code])
+both_AR = unique(ALL_vs_FULL[submodel.x=='A11111111111111' & AUC.Agonist.y.bin==1 & AUC.Antagonist.y.bin==1, code])
+```
+
+```{r}
+length(antagonists_AR)
+length(agonists_AR)
+length(both_AR)
+```
+
+```{r}
+# The evaluation of binary classifiers (the full model as a standard method and subset models being investigated) was performed via sensitivity, specificity, and balanced accuracy (BA) metrics. Each metric describes a different goal. For example, sensitivity tells how well the model identifies true positives (TP), and specificity tells how well the model identifies true negatives (TN). TPs are of fundamental importance for the project as in the Tier 1 studies we want to identify all chemicals that interact with the AR receptor. 
+
+# Therefore, define TP, FP, TN, and FN values for:
+# 1. Agonist mode
+ALL_vs_FULL[,'TP.Agonist' := ifelse(((AUC.Agonist.x.bin==1) & (AUC.Agonist.y.bin==1)),1,0)]
+ALL_vs_FULL[,'FP.Agonist' := ifelse(((AUC.Agonist.x.bin==1) & (AUC.Agonist.y.bin==0)),1,0)]
+ALL_vs_FULL[,'TN.Agonist' := ifelse(((AUC.Agonist.x.bin==0) & (AUC.Agonist.y.bin==0)),1,0)]
+ALL_vs_FULL[,'FN.Agonist' := ifelse(((AUC.Agonist.x.bin==0) & (AUC.Agonist.y.bin==1)),1,0)]
+
+# 2. Antagonist mode
+ALL_vs_FULL[,'TP.Antagonist' := ifelse(((AUC.Antagonist.x.bin==1) & (AUC.Antagonist.y.bin==1)),1,0)]
+ALL_vs_FULL[,'FP.Antagonist' := ifelse(((AUC.Antagonist.x.bin==1) & (AUC.Antagonist.y.bin==0)),1,0)]
+ALL_vs_FULL[,'TN.Antagonist' := ifelse(((AUC.Antagonist.x.bin==0) & (AUC.Antagonist.y.bin==0)),1,0)]
+ALL_vs_FULL[,'FN.Antagonist' := ifelse(((AUC.Antagonist.x.bin==0) & (AUC.Antagonist.y.bin==1)),1,0)]
+```
+
+```{r}
+# Define sensitivity (TPR = TP/(TP+FN)), specificity (TNR = TN/(TN+FP)), balanced accuracy ((TPR+TNR)/2), and  positive predictive value (PPV = TP/(TP + FP)) for each subset model across all chemicals in:
+# 1. Agonist mode
+ALL_vs_FULL[,'sens.Agonist.allchem' := sum(TP.Agonist)/(sum(TP.Agonist)+sum(FN.Agonist)),by = .(submodel.x)]
+ALL_vs_FULL[,'spec.Agonist.allchem' := sum(TN.Agonist)/(sum(TN.Agonist)+sum(FP.Agonist)),by = .(submodel.x)]
+#ALL_vs_FULL[,'ba.Agonist.allchem' := (sens.Agonist.allchem+spec.Agonist.allchem)/2.0]
+#ALL_vs_FULL[,'ppv.Agonist.allchem' := sum(TP.Agonist)/(sum(TP.Agonist)+sum(FP.Agonist)),by = .(submodel.x)]
+
+# 2. Antagonist mode
+ALL_vs_FULL[,'sens.Antagonist.allchem' := sum(TP.Antagonist)/(sum(TP.Antagonist)+sum(FN.Antagonist)),by = .(submodel.x)]
+ALL_vs_FULL[,'spec.Antagonist.allchem' := sum(TN.Antagonist)/(sum(TN.Antagonist)+sum(FP.Antagonist)),by = .(submodel.x)]
+#ALL_vs_FULL[,'ba.Antagonist.allchem' := (sens.Antagonist.allchem+spec.Antagonist.allchem)/2.0]
+#ALL_vs_FULL[,'ppv.Antagonist.allchem' := sum(TP.Antagonist)/(sum(TP.Antagonist)+sum(FP.Antagonist)),by = .(submodel.x)]
+```
+
+```{r}
+cat('Number of subset models with agonist sensitivity > agonist specificity:\n',length(unique(ALL_vs_FULL[sens.Agonist.allchem>spec.Agonist.allchem, submodel.x])),'\n')
+cat('Number of subset models with antagonist sensitivity > antagonist specificity:\n',length(unique(ALL_vs_FULL[sens.Antagonist.allchem>spec.Antagonist.allchem, submodel.x])),'\n')
+```
+
+```{r}
+# Performance of all submodels
+perf_submodel_all = unique(ALL_vs_FULL[,.(submodel.x,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)])
+
+write.csv(perf_submodel_all, paste0(output,'/02/Subset model performance for all chemicals.csv'))
+```
+
+```{r}
+# Calculate the number of assays within the subset model.
+ALL_vs_FULL[,'assays':=stringr::str_replace(submodel.x, "A", "")]
+ALL_vs_FULL$assays = sapply(strsplit(ALL_vs_FULL$assays, ""), function(x) sum(as.integer(x)))
+```
+
+```{r}
+ALL_vs_FULL[,amask:=submodel.x] # introducing "amask" for convenience
+```
+
+```{r}
+setnames(ALL_vs_FULL,old=c("casrn"),new=c("CASRN"))
+```
+
+```{r}
+In_vitro_ref=c(
+'52806-53-8',
+'90357-06-5',
+'122-14-5',
+'10540-29-1',
+'52-01-7',
+'63612-50-0',
+'427-51-0',
+'80-05-7',
+'330-55-2',
+'50471-44-8',
+'13311-84-7',
+'67747-09-5',
+'140-66-9',
+'72-43-5',
+'72-55-9',
+'60207-90-1',
+'17924-92-4',
+'789-02-6',
+'32809-16-8',
+'60168-88-9',
+'58-18-4',
+'58-22-0',
+'63-05-8',
+'1912-24-9',
+'52918-63-5',
+'486-66-8',
+'16752-77-5',
+'122-34-9',
+'10161-33-8',
+'797-63-7',
+'965-93-5',
+'68-22-4',
+'51-98-9',
+'76-43-7',
+'434-22-0',
+'521-18-6',
+'10418-03-8',
+'71-58-9',
+'68-23-5',
+'57-91-0',
+'68359-37-5',
+'52315-07-8',
+'17804-35-2',
+'85-68-7',
+'10605-21-7',
+'51630-58-1',
+'98319-26-7',
+'129453-61-8',
+'36734-19-7',
+'50-29-3',
+'52645-53-1',
+'501-36-0',
+'7696-12-0',
+'84371-65-3')
+```
+
+```{r}
+unique(ALL_vs_FULL[assays==2 & CASRN %in% In_vitro_ref & amask=="A00000000001001"])
+```
+
+```{r}
+# 2. COMPARE 14-assay AR model results with 11-assay AR model results
+AR_11 = as.data.table(openxlsx::read.xlsx(paste0(input,"/tx6b00347_si_004.xlsx")))[,.(CODE,CASRN,AUC.Agonist,AUC.Antagonist)] # read data
+AR_11_2 = as.data.table(openxlsx::read.xlsx(paste0(input,"/tx6b00347_si_004.xlsx")))[,.(DSSToxGSID,Name,CODE,CASRN,AUC.Agonist,AUC.Antagonist)] # read data
+AR_14 = ALL_vs_FULL[amask=="A11111111111111",.(code,CASRN,AUC.Agonist.x,AUC.Antagonist.x,AUC.Agonist.x.bin,AUC.Antagonist.x.bin)] # select the full model results
+AR_14_2 = ALL_vs_FULL[amask=="A11111111111111",.(code,CASRN,name,AUC.Agonist.x,AUC.Antagonist.x,AUC.Agonist.x.bin,AUC.Antagonist.x.bin)] # select the full model results
+
+AR_11[,'AUC.Agonist.bin':=ifelse(AUC.Agonist<0.1,0,1)] # binarize outputs of the 11 assay model
+AR_11[,'AUC.Antagonist.bin':=ifelse(AUC.Antagonist<0.1,0,1)] # binarize outputs of the 11 assay model
+
+AR_11_2[,'AUC.Agonist.bin':=ifelse(AUC.Agonist<0.1,0,1)] # binarize outputs of the 11 assay model
+AR_11_2[,'AUC.Antagonist.bin':=ifelse(AUC.Antagonist<0.1,0,1)] # binarize outputs of the 11 assay model
+
+#names(AR_14)
+
+setnames(AR_14,old=names(AR_14),new=c('CODE','CASRN','AUC.Agonist','AUC.Antagonist','AUC.Agonist.bin','AUC.Antagonist.bin'))
+setnames(AR_14_2,old=names(AR_14_2),new=c('CODE','CASRN','Name','AUC.Agonist','AUC.Antagonist','AUC.Agonist.bin','AUC.Antagonist.bin'))
+
+AR_14_11 = merge(AR_14,AR_11,by=c('CODE')) # do not merge by CASRN, there is an error in AR_11
+AR_14_2_11_2 = merge(AR_14_2,AR_11_2,by=c('CODE')) # do not merge by CASRN, there is an error in AR_11
+```
+
+```{r}
+AR_11_2022 = ALL_vs_FULL[amask=="A11111011110011",.(code,CASRN,AUC.Agonist.x,AUC.Antagonist.x,AUC.Agonist.x.bin,AUC.Antagonist.x.bin)] # select the full model results
+setnames(AR_11_2022,old='code',new='CODE')
+```
+
+
+```{r}
+AR_14_11_11 = merge(AR_14_2_11_2,AR_11_2022,by=c('CODE'))
+```
+
+```{r}
+setnames(AR_14_11_11,old=names(AR_14_11_11),new=c('CODE',
+                                            'CASRN_AR14',
+                                            'Name_AR14',
+                                            'AUC_Agonist_AR14',
+                                            'AUC_Antagonist_AR14',
+                                            'AUC_Agonist_bin_AR14',
+                                            'AUC_Antagonist_bin_AR14',
+                                            'DSSToxGSID_AR11_2017',
+                                            'Name_AR11_2017',
+                                            'CASRN_AR11_2017',
+                                            'AUC_Agonist_AR11_2017',
+                                            'AUC_Antagonist_AR11_2017',
+                                            'AUC_Agonist_bin_AR11_2017',
+                                            'AUC_Antagonist_bin_AR14_2017',
+                                            'CASRN_AR11sub_2020',
+                                            'AUC_Agonist_AR11sub_2020',
+                                            'AUC_Antagonist_AR11sub_2020',
+                                            'AUC_Agonist_bin_AR11sub_2020',
+                                            'AUC_Antagonist_bin_AR11sub_2020'
+                                            ))
+```
+
+```{r}
+write.csv(AR_14_11_11,paste0(output,'/02/AR14_AR11-2017_AR11sub.csv'))
+```
+
+```{r}
+AR_14_11[AUC.Antagonist.bin.x==1 & AUC.Antagonist.bin.y==1,"Antagonist: AR_14 = Pos & AR_11 = Pos":=length(CODE)]
+AR_14_11[AUC.Antagonist.bin.x==1 & AUC.Antagonist.bin.y==0,"Antagonist: AR_14 = Pos & AR_11 = Neg":=length(CODE)]
+AR_14_11[AUC.Antagonist.bin.x==0 & AUC.Antagonist.bin.y==0,"Antagonist: AR_14 = Neg & AR_11 = Neg":=length(CODE)]
+AR_14_11[AUC.Antagonist.bin.x==0 & AUC.Antagonist.bin.y==1,"Antagonist: AR_14 = Neg & AR_11 = Pos":=length(CODE)]
+
+AR_14_11[AUC.Agonist.bin.x==1 & AUC.Agonist.bin.y==1,"Agonist: AR_14 = Pos & AR_11 = Pos":=length(CODE)]
+AR_14_11[AUC.Agonist.bin.x==1 & AUC.Agonist.bin.y==0,"Agonist: AR_14 = Pos & AR_11 = Neg":=length(CODE)]
+AR_14_11[AUC.Agonist.bin.x==0 & AUC.Agonist.bin.y==0,"Agonist: AR_14 = Neg & AR_11 = Neg":=length(CODE)]
+AR_14_11[AUC.Agonist.bin.x==0 & AUC.Agonist.bin.y==1,"Agonist: AR_14 = Neg & AR_11 = Pos":=length(CODE)]
+
+AR_14_11_Antagonist = cbind(unique(AR_14_11[!is.na(`Antagonist: AR_14 = Pos & AR_11 = Pos`),"Antagonist: AR_14 = Pos & AR_11 = Pos"]),
+            unique(AR_14_11[!is.na(`Antagonist: AR_14 = Pos & AR_11 = Neg`),"Antagonist: AR_14 = Pos & AR_11 = Neg"]),
+            unique(AR_14_11[!is.na(`Antagonist: AR_14 = Neg & AR_11 = Neg`),"Antagonist: AR_14 = Neg & AR_11 = Neg"]),
+            unique(AR_14_11[!is.na(`Antagonist: AR_14 = Neg & AR_11 = Pos`),"Antagonist: AR_14 = Neg & AR_11 = Pos"]))
+AR_14_11_Agonist = cbind(unique(AR_14_11[!is.na(`Agonist: AR_14 = Pos & AR_11 = Pos`),"Agonist: AR_14 = Pos & AR_11 = Pos"]),
+            unique(AR_14_11[!is.na(`Agonist: AR_14 = Pos & AR_11 = Neg`),"Agonist: AR_14 = Pos & AR_11 = Neg"]),
+            unique(AR_14_11[!is.na(`Agonist: AR_14 = Neg & AR_11 = Neg`),"Agonist: AR_14 = Neg & AR_11 = Neg"]),
+            unique(AR_14_11[!is.na(`Agonist: AR_14 = Neg & AR_11 = Pos`),"Agonist: AR_14 = Neg & AR_11 = Pos"]))
+
+AR_14_11_Antagonist = t(AR_14_11_Antagonist)
+AR_14_11_Agonist = t(AR_14_11_Agonist)
+write.csv(AR_14_11_Antagonist,paste0(output,'/02/AR_14_11_Antagonist.csv'))
+write.csv(AR_14_11_Agonist,paste0(output,'/02/AR_14_11_Agonist.csv'))
+```
+
+```{r}
+# 3. BEST PERFORMING SUBSET MODELS (across all chemicals)
+```
+
+```{r}
+# 3.1 Performance criterion defined by EPA
+# In antagonist mode, specificity should be greater than 85%, and sensitivity as much as possible (use >95%).
+Antagonist_criterion = ALL_vs_FULL[spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,
+                                   .(assays,amask,submodel.x,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)]
+
+Antagonist_criterion = unique(Antagonist_criterion)
+Antagonist_criterion = Antagonist_criterion[order(assays,-sens.Antagonist.allchem,spec.Antagonist.allchem),] # order
+Antagonist_criterion$amask = factor(Antagonist_criterion$amask, levels=unique(Antagonist_criterion$amask)) # Convert "amask" into factors, and melt. This is done for plotting purposes.
+print(Antagonist_criterion)
+write.csv(Antagonist_criterion,paste0(output,'/02/Antagonist_criterion.csv'))
+
+```
+
+```{r}
+cat('Number of subset models that satisfy sensitivity and specificity criterions for detection of antagonist effects: \n',length(unique(Antagonist_criterion$submodel.x)),'\n')
+```
+
+```{r}
+# Agonist mode should be processed similarly as antagonist mode.
+# Therefore, in agonist mode, specificity should be greater than 85%, and sensitivity as much as possible (use >95%).
+
+Agonist_criterion = ALL_vs_FULL[spec.Agonist.allchem>0.85 & sens.Agonist.allchem>0.95,
+                                   .(assays,amask,submodel.x,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)]
+Agonist_criterion = unique(Agonist_criterion)
+Agonist_criterion = Agonist_criterion[order(assays,-sens.Agonist.allchem,spec.Agonist.allchem),] # order
+Agonist_criterion$amask = factor(Agonist_criterion$amask, levels=unique(Agonist_criterion$amask)) # Convert "amask" into factors, and melt. This is done for plotting purposes.
+print(Agonist_criterion)
+write.csv(Agonist_criterion,paste0(output,'/02/Agonist_criterion.csv'))
+```
+
+```{r}
+cat('Number of subset models that satisfy sensitivity and specificity criterions for detection of agonist effects: \n',length(unique(Agonist_criterion$submodel.x)),'\n')
+```
+
+```{r}
+# Assays that have the practical purpose of selecting Antagonist activity in all chemicals.
+practical_assays = unique(Antagonist_criterion$submodel.x)
+```
+
+```{r}
+# Assays that have the practical purpose of selecting Agonist activity in all chemicals.
+practical_assays_agon = unique(Agonist_criterion$submodel.x)
+```
+
+```{r}
+# Any overlap between the subset models, i.e. subset models that show up in both modes?
+practical_assays_agon[practical_assays_agon %in% practical_assays]
+```
+
+```{r}
+# 13 assay models are not too practical.
+# Lets see if I can find smaller subset models.
+# Hamming distance - The Hamming distance gives the result of how many attributes where different
+```
+
+```{r}
+# 3.2 Identify assays that are often present in subset models (with good sensitivity and specificity performance).
+
+splitAMASK = function(x){
+    x = sub('.', '',x)
+    x_list = as.list(as.integer(as.vector(str_split_fixed(x, pattern = "", n = nchar(x)))))
+    return(x_list)
+
+}
+```
+
+```{r}
+split_AMASK = paste0('A',1:14)
+Antagonist_criterion[,(split_AMASK):=splitAMASK(submodel.x),by=1:nrow(Antagonist_criterion)]
+Antagonist_criterion[,c("submodel.x","A1","A2","A3","A4","A5","A6","A7","A8","A9","A10","A11","A12","A13","A14")]
+```
+
+```{r}
+Agonist_criterion[,(split_AMASK):=splitAMASK(submodel.x),by=1:nrow(Agonist_criterion)]
+Agonist_criterion[,c("submodel.x","A1","A2","A3","A4","A5","A6","A7","A8","A9","A10","A11","A12","A13","A14")]
+```
+
+```{r}
+prcntg = function(x){
+    round(100*sum(x)/length(x),2)
+}
+```
+
+```{r}
+Antagonist_criterion[,lapply(.SD,sum),.SDcols=split_AMASK]
+Agonist_criterion[,lapply(.SD,sum),.SDcols=split_AMASK]
+```
+
+```{r}
+# Plot these results
+AP_anta = melt(Antagonist_criterion[,lapply(.SD,prcntg),.SDcols=split_AMASK],measure.vars = split_AMASK, variable.name = "Assay_ID", value.name = "Percentage")
+AP_agon = melt(Agonist_criterion[,lapply(.SD,prcntg),.SDcols=split_AMASK],measure.vars = split_AMASK, variable.name = "Assay_ID", value.name = "Percentage")
+```
+
+```{r}
+AP_anta[,'effect':='Antagonist']
+AP_agon[,'effect':='Agonist']
+AP = rbind(AP_anta,AP_agon)
+
+Assay_names = data.table(Assay_ID=c("A1","A2","A3","A4","A5","A6","A7","A8","A9","A10","A11","A12","A13","A14"),
+                         Assay_endpoint_name = c('NVS_NR_hAR','NVS_NR_cAR','NVS_NR_rAR','OT_AR_ARSRC1_0480','OT_AR_ARSRC1_0960',
+                                                 'UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist','ATG_AR_TRANS_up','OT_AR_ARELUC_AG_1440','TOX21_AR_BLA_Agonist_ratio',
+                                                 'TOX21_AR_LUC_MDAKB2_Agonist','ACEA_AR_agonist_80hr','UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist',
+                                                 'TOX21_AR_BLA_Antagonist_ratio','TOX21_AR_LUC_MDAKB2_Antagonist_0.5 nM_R1881'))
+Assay_names$Assay_endpoint_name = factor(Assay_names$Assay_endpoint_name, levels=unique(Assay_names$Assay_endpoint_name))
+
+AP = merge(AP,Assay_names,by='Assay_ID')
+```
+
+```{r}
+p = ggplot(data=AP, aes(x=Assay_endpoint_name, y=Percentage, fill=effect)) +
+geom_bar(stat="identity", position=position_dodge()) + 
+scale_fill_manual("legend", values = c("Agonist" = "blue", "Antagonist" = "red"))+
+theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5),
+      panel.grid.major.y = element_line(color = "#cccccc"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(fill = FALSE),
+      panel.background = element_blank())+
+xlab('Assay endpoint name')
+
+ggsave(file=paste0(figures,"/02/Figure 5 - Assay prevalence in subset models.svg"), plot=p, width=8, height=8)
+p
+```
+
+```{r}
+hammingDistance = function(x,y){
+    
+    # This function returns the Hamming distance. 
+    # The Hamming distance gives the result of how many attributes/assays where different.
+    
+    x = sub('.', '',x)
+    y = sub('.', '',y)
+    x_vector = as.vector(str_split_fixed(x, pattern = "", n = nchar(x)))
+    y_vector = as.vector(str_split_fixed(y, pattern = "", n = nchar(y)))
+    sum(x_vector != y_vector)
+}
+```
+
+```{r}
+practical_assays_anta = unique(Antagonist_criterion$submodel.x)
+practical_assays_agon = unique(Agonist_criterion$submodel.x)
+```
+
+```{r}
+# This data.frame will be used later in calculation of the Hamming distance.
+H = data.frame(matrix(ncol = length(practical_assays_agon), nrow = length(practical_assays_anta)),row.names = practical_assays_anta)
+colnames(H) = practical_assays_agon
+```
+
+```{r}
+# Calculate the Hamming distance between all pairs of subset models (these subset models satisfy specificity and sensitivity criterion).
+for(i in 1:length(rownames(H))){
+    for(j in 1:length(colnames(H))){
+        H[i,j] = hammingDistance(rownames(H)[i],colnames(H)[j])
+    }
+}
+```
+
+```{r}
+# This data.frame will be used later in the calculation of the union of assays between pairs of antagonist and agonist subset models.
+U = copy(H)
+```
+
+```{r}
+assaysUnionSum = function(x,y){
+    
+    # This function finds a union of assays between two submodels, and returns the number of assays present in the union.
+    # For example, assays present in union of A01001000000111 and A00101011101000 are: A2,A3,A5,A7,A8,A9,A11,A12,A13, and A14.
+    # The number of unique assays present in both subset models is 10.
+    
+    x = sub('.', '',x) # remove "A" infront of the subset model
+    y = sub('.', '',y) # remove "A" infront of the subset model
+    
+    x_vector = as.vector(str_split_fixed(x, pattern = "", n = nchar(x))) # convert binary string into a character vector
+    y_vector = as.vector(str_split_fixed(y, pattern = "", n = nchar(y))) # convert binary string into a character vector
+    
+    x_1 = which(x_vector=='1') # which character is "1"
+    y_1 = which(y_vector=='1') # which character is "1"
+    
+    return(length(union(x_1,y_1))) # find the union of vectors and return its length
+    
+}
+```
+
+```{r}
+# Calculate Union between subset models.
+for(i in 1:length(rownames(U))){
+    for(j in 1:length(colnames(U))){
+        U[i,j] = assaysUnionSum(rownames(U)[i],colnames(U)[j])
+    }
+}
+```
+
+```{r}
+# For each Hamming distance, find pairs of subset models with the smallest number of assays.
+
+Assays_fit_list = list()
+Best_assays_fit_list = list()
+
+for(k in 0:max(H)){ # for each Hamming distance...
+hamming_distance = k
+
+a <- which(H==hamming_distance,arr.ind=T,useNames = FALSE) # ...identify subset model pairs...
+a2 = as.data.table(a)
+print(nrow(a))
+    
+    for(i in 1:nrow(a)){ # ...for every pair of subset models...
+        x = rownames(H[a[i,1],])
+        y = colnames(H[a[i,2]])
+        
+        a2[i,antagonist_subset_model:=x]
+        a2[i,agonist_subset_model:=y]
+        a2[i,Hamming_distance:=hamming_distance]
+        
+        x = sub('.', '',x)
+        y = sub('.', '',y)
+        
+        x_vector = as.vector(str_split_fixed(x, pattern = "", n = nchar(x)))
+        y_vector = as.vector(str_split_fixed(y, pattern = "", n = nchar(y)))
+        
+        x_1 = which(x_vector=='1')
+        y_1 = which(y_vector=='1')
+        
+        a2[i,assays:=paste(union(x_1,y_1), collapse = " ")] # ...find the union of assays...
+        a2[i,n_assays:=length(union(x_1,y_1))] # ...calculate the number of assays in the union...
+        
+        Assays_fit_list[[k+1]] = a2
+    }
+    
+    a3 = a2[n_assays==min(n_assays)] # ...select only those with the smallest number of assays in the union...
+    Best_assays_fit_list[[k+1]] = a3 # and save them.
+    
+}
+
+Best_combination_subset_models_all_chems = rbindlist((Best_assays_fit_list))
+Combination_subset_models_all_chems = rbindlist((Assays_fit_list))
+```
+
+```{r}
+cat('Number of investigated agonis-antagonist subset model pairs:\n',nrow(Combination_subset_models_all_chems))
+
+write.csv(Combination_subset_models_all_chems[order(n_assays,-Hamming_distance)][,-c(1:2)],paste0(output,'/02/S1 - Union of assays.csv'))
+```
+
+```{r}
+# Are these two identical
+identical(Combination_subset_models_all_chems[n_assays==9],
+          Best_combination_subset_models_all_chems[n_assays==9])
+```
+
+```{r}
+# Select only pairs with the smallest number of assays
+BEST9 = Best_combination_subset_models_all_chems[n_assays==9][order(-Hamming_distance)]
+BEST9
+```
+
+```{r}
+cat('Number of subset model pairs with the the smallest number of assays:\n',nrow(BEST9))
+```
+
+```{r}
+# Bring performance info 
+BEST9 = merge(x = BEST9,y = unique(ALL_vs_FULL[,.(submodel.x,sens.Antagonist.allchem,spec.Antagonist.allchem)]),by.x = 'antagonist_subset_model',by.y = 'submodel.x')
+BEST9 = merge(x = BEST9,y = unique(ALL_vs_FULL[,.(submodel.x,sens.Agonist.allchem,spec.Agonist.allchem)]),by.x = 'agonist_subset_model',by.y = 'submodel.x')
+
+# Calculate the number of assays within antagonist subset model.
+BEST9[,'n_assays_anta':=stringr::str_replace(antagonist_subset_model, "A", "")]
+BEST9$n_assays_anta = sapply(strsplit(BEST9$n_assays_anta, ""), function(x) sum(as.integer(x)))
+
+# Calculate the number of assays within the subset model.
+BEST9[,'n_assays_agon':=stringr::str_replace(agonist_subset_model, "A", "")]
+BEST9$n_assays_agon = sapply(strsplit(BEST9$n_assays_agon, ""), function(x) sum(as.integer(x)))
+
+BEST9 = BEST9[order(n_assays_anta,sens.Antagonist.allchem,-spec.Antagonist.allchem)]
+
+write.csv(BEST9,paste0(output,'/02/Table 5 - 9-assay battery.csv'))
+
+```
+
+```{r}
+# Performance against the reference chemicals.
+Judson_2020_ref = as.data.table(openxlsx::read.xlsx(paste0(input,"/Supplemental Table S1 - AR pathway reference chemicals in vitro in vivo.xlsx")))
+Judson_2020_ref_invitro = Judson_2020_ref[vivo_vitro=="invitro",.(code,casrn,vivo_vitro,author="Judson_2020")]
+Judson_2020_ref_invivo = Judson_2020_ref[vivo_vitro=="invivo",.(code,casrn,vivo_vitro,author="Judson_2020")]
+Kleinstreuer_2017_ref_invitro = as.data.table(openxlsx::read.xlsx(paste0(input,"/Reference Chemicals v2.xlsx")))[In.Vitro.Reference.Chemicals.Affecting=="AR Pathway",.(CASRN)]
+```
+
+```{r}
+Kleinstreuer_2017_ref_invitro[,c("code","vivo_vitro","author") := .(paste0("C",str_replace_all(CASRN, '-', '')),"invitro","Kleinstreuer_2017")]
+setnames(Kleinstreuer_2017_ref_invitro,old="CASRN",new="casrn")
+```
+
+```{r}
+length(Kleinstreuer_2017_ref_invitro$code)
+length(Kleinstreuer_2017_ref_invitro$code[Kleinstreuer_2017_ref_invitro$code %in% unique(ALL_vs_FULL$code)])
+```
+
+```{r}
+length(Judson_2020_ref_invitro$code)
+length(Judson_2020_ref_invitro$code[Judson_2020_ref_invitro$code %in% unique(ALL_vs_FULL$code)])
+
+length(Judson_2020_ref_invivo$code)
+length(Judson_2020_ref_invivo$code[Judson_2020_ref_invivo$code %in% unique(ALL_vs_FULL$code)])
+```
+
+```{r}
+Judson_2020_ref_invivo_antagonist = ALL_vs_FULL[code %in% unique(Judson_2020_ref_invivo$code) & submodel.x %in% unique(BEST9$antagonist_subset_model),.(code,TP.Antagonist,FP.Antagonist,TN.Antagonist,FN.Antagonist,submodel.x)]
+
+Judson_2020_ref_invivo_agonist = ALL_vs_FULL[code %in% unique(Judson_2020_ref_invivo$code) & submodel.x %in% unique(BEST9$agonist_subset_model),.(code,TP.Agonist,FP.Agonist,TN.Agonist,FN.Agonist,submodel.x)]
+```
+
+```{r}
+# 1. Agonist mode
+Judson_2020_ref_invivo_agonist[,'sens.Agonist.Judson_2020_ref_invivo' := sum(TP.Agonist)/(sum(TP.Agonist)+sum(FN.Agonist)),by = .(submodel.x)]
+Judson_2020_ref_invivo_agonist[,'spec.Agonist.Judson_2020_ref_invivo' := sum(TN.Agonist)/(sum(TN.Agonist)+sum(FP.Agonist)),by = .(submodel.x)]
+
+# 2. Antagonist mode
+Judson_2020_ref_invivo_antagonist[,'sens.Antagonist.Judson_2020_ref_invivo' := sum(TP.Antagonist)/(sum(TP.Antagonist)+sum(FN.Antagonist)),by = .(submodel.x)]
+Judson_2020_ref_invivo_antagonist[,'spec.Antagonist.Judson_2020_ref_invivo' := sum(TN.Antagonist)/(sum(TN.Antagonist)+sum(FP.Antagonist)),by = .(submodel.x)]
+
+write.csv(Judson_2020_ref_invivo_agonist,paste0(output,'/02/Judson_2020_ref_invivo_agonist.csv'))
+write.csv(Judson_2020_ref_invivo_antagonist,paste0(output,'/02/Judson_2020_ref_invivo_antagonist.csv'))
+```
+
+```{r}
+Judson_2020_ref_invitro_antagonist = ALL_vs_FULL[code %in% unique(Judson_2020_ref_invitro$code) & submodel.x %in% unique(BEST9$antagonist_subset_model),.(code,TP.Antagonist,FP.Antagonist,TN.Antagonist,FN.Antagonist,submodel.x)]
+
+Judson_2020_ref_invitro_agonist = ALL_vs_FULL[code %in% unique(Judson_2020_ref_invitro$code) & submodel.x %in% unique(BEST9$agonist_subset_model),.(code,TP.Agonist,FP.Agonist,TN.Agonist,FN.Agonist,submodel.x)]
+```
+
+```{r}
+# 1. Agonist mode
+Judson_2020_ref_invitro_agonist[,'sens.Agonist.Judson_2020_ref_invitro' := sum(TP.Agonist)/(sum(TP.Agonist)+sum(FN.Agonist)),by = .(submodel.x)]
+Judson_2020_ref_invitro_agonist[,'spec.Agonist.Judson_2020_ref_invitro' := sum(TN.Agonist)/(sum(TN.Agonist)+sum(FP.Agonist)),by = .(submodel.x)]
+
+# 2. Antagonist mode
+Judson_2020_ref_invitro_antagonist[,'sens.Antagonist.Judson_2020_ref_invitro' := sum(TP.Antagonist)/(sum(TP.Antagonist)+sum(FN.Antagonist)),by = .(submodel.x)]
+Judson_2020_ref_invitro_antagonist[,'spec.Antagonist.Judson_2020_ref_invitro' := sum(TN.Antagonist)/(sum(TN.Antagonist)+sum(FP.Antagonist)),by = .(submodel.x)]
+
+write.csv(Judson_2020_ref_invitro_agonist,paste0(output,'/02/Judson_2020_ref_invitro_agonist.csv'))
+write.csv(Judson_2020_ref_invitro_antagonist,paste0(output,'/02/Judson_2020_ref_invitro_antagonist.csv'))
+```
+
+```{r}
+Kleinstreuer_2017_ref_invitro_antagonist = ALL_vs_FULL[code %in% unique(Kleinstreuer_2017_ref_invitro$code) & submodel.x %in% unique(BEST9$antagonist_subset_model),.(code,TP.Antagonist,FP.Antagonist,TN.Antagonist,FN.Antagonist,submodel.x)]
+
+Kleinstreuer_2017_ref_invitro_agonist = ALL_vs_FULL[code %in% unique(Kleinstreuer_2017_ref_invitro$code) & submodel.x %in% unique(BEST9$agonist_subset_model),.(code,TP.Agonist,FP.Agonist,TN.Agonist,FN.Agonist,submodel.x)]
+```
+
+```{r}
+# 1. Agonist mode
+Kleinstreuer_2017_ref_invitro_agonist[,'sens.Agonist.Kleinstreuer_2017_ref_invitro' := sum(TP.Agonist)/(sum(TP.Agonist)+sum(FN.Agonist)),by = .(submodel.x)]
+Kleinstreuer_2017_ref_invitro_agonist[,'spec.Agonist.Kleinstreuer_2017_ref_invitro' := sum(TN.Agonist)/(sum(TN.Agonist)+sum(FP.Agonist)),by = .(submodel.x)]
+
+# 2. Antagonist mode
+Kleinstreuer_2017_ref_invitro_antagonist[,'sens.Antagonist.Kleinstreuer_2017_ref_invitro' := sum(TP.Antagonist)/(sum(TP.Antagonist)+sum(FN.Antagonist)),by = .(submodel.x)]
+Kleinstreuer_2017_ref_invitro_antagonist[,'spec.Antagonist.Kleinstreuer_2017_ref_invitro' := sum(TN.Antagonist)/(sum(TN.Antagonist)+sum(FP.Antagonist)),by = .(submodel.x)]
+
+write.csv(Kleinstreuer_2017_ref_invitro_agonist,paste0(output,'/02/Kleinstreuer_2017_ref_invitro_agonist.csv'))
+write.csv(Kleinstreuer_2017_ref_invitro_antagonist,paste0(output,'/02/Kleinstreuer_2017_ref_invitro_antagonist.csv'))
+```
+
+```{r}
+Judson_2020_ref_invivo_agonist_final = unique(Judson_2020_ref_invivo_agonist[,.(submodel.x,sens.Agonist.Judson_2020_ref_invivo,spec.Agonist.Judson_2020_ref_invivo,"agonist_antagonis"='Agonist',"vivo_vitro"="invivo","Ref."="Judson et al. (2020)")])
+
+setnames(Judson_2020_ref_invivo_agonist_final,
+         old=c("submodel.x","sens.Agonist.Judson_2020_ref_invivo","spec.Agonist.Judson_2020_ref_invivo"),
+         new=c("Submodel","Sensitivity","Specificity"))
+Judson_2020_ref_invivo_agonist_final
+```
+
+```{r}
+Judson_2020_ref_invivo_antagonist_final = unique(Judson_2020_ref_invivo_antagonist[,.(submodel.x,sens.Antagonist.Judson_2020_ref_invivo,spec.Antagonist.Judson_2020_ref_invivo,"agonist_antagonis"='Antagonist',"vivo_vitro"="invivo","Ref."="Judson et al. (2020)")])
+
+setnames(Judson_2020_ref_invivo_antagonist_final,
+         old=c("submodel.x","sens.Antagonist.Judson_2020_ref_invivo","spec.Antagonist.Judson_2020_ref_invivo"),
+         new=c("Submodel","Sensitivity","Specificity"))
+Judson_2020_ref_invivo_antagonist_final
+```
+
+```{r}
+Judson_2020_ref_invitro_agonist_final = unique(Judson_2020_ref_invitro_agonist[,.(submodel.x,sens.Agonist.Judson_2020_ref_invitro,spec.Agonist.Judson_2020_ref_invitro,"agonist_antagonis"='Agonist',"vivo_vitro"="invitro","Ref."="Judson et al. (2020)")])
+
+setnames(Judson_2020_ref_invitro_agonist_final,
+         old=c("submodel.x","sens.Agonist.Judson_2020_ref_invitro","spec.Agonist.Judson_2020_ref_invitro"),
+         new=c("Submodel","Sensitivity","Specificity"))
+Judson_2020_ref_invitro_agonist_final
+```
+
+```{r}
+Judson_2020_ref_invitro_antagonist_final = unique(Judson_2020_ref_invitro_antagonist[,.(submodel.x,sens.Antagonist.Judson_2020_ref_invitro,spec.Antagonist.Judson_2020_ref_invitro,"agonist_antagonis"='Antagonist',"vivo_vitro"="invitro","Ref."="Judson et al. (2020)")])
+
+setnames(Judson_2020_ref_invitro_antagonist_final,
+         old=c("submodel.x","sens.Antagonist.Judson_2020_ref_invitro","spec.Antagonist.Judson_2020_ref_invitro"),
+         new=c("Submodel","Sensitivity","Specificity"))
+Judson_2020_ref_invitro_antagonist_final
+```
+
+```{r}
+Kleinstreuer_2017_ref_invitro_agonist_final = unique(Kleinstreuer_2017_ref_invitro_agonist[,.(submodel.x,sens.Agonist.Kleinstreuer_2017_ref_invitro,spec.Agonist.Kleinstreuer_2017_ref_invitro,"agonist_antagonis"='Agonist',"vivo_vitro"="invitro","Ref."="Kleinstreuer et al. (2017)")])
+
+setnames(Kleinstreuer_2017_ref_invitro_agonist_final,
+         old=c("submodel.x","sens.Agonist.Kleinstreuer_2017_ref_invitro","spec.Agonist.Kleinstreuer_2017_ref_invitro"),
+         new=c("Submodel","Sensitivity","Specificity"))
+Kleinstreuer_2017_ref_invitro_agonist_final
+```
+
+```{r}
+Kleinstreuer_2017_ref_invitro_antagonist_final = unique(Kleinstreuer_2017_ref_invitro_antagonist[,.(submodel.x,sens.Antagonist.Kleinstreuer_2017_ref_invitro,spec.Antagonist.Kleinstreuer_2017_ref_invitro,"agonist_antagonis"='Antagonist',"vivo_vitro"="invitro","Ref."="Kleinstreuer et al. (2017)")])
+
+setnames(Kleinstreuer_2017_ref_invitro_antagonist_final,
+         old=c("submodel.x","sens.Antagonist.Kleinstreuer_2017_ref_invitro","spec.Antagonist.Kleinstreuer_2017_ref_invitro"),
+         new=c("Submodel","Sensitivity","Specificity"))
+Kleinstreuer_2017_ref_invitro_antagonist_final
+```
+
+```{r}
+REF_perf = rbindlist(list(Kleinstreuer_2017_ref_invitro_antagonist_final,
+                       Kleinstreuer_2017_ref_invitro_agonist_final, 
+                       Judson_2020_ref_invitro_antagonist_final, 
+                       Judson_2020_ref_invitro_agonist_final, 
+                       Judson_2020_ref_invivo_antagonist_final,
+                       Judson_2020_ref_invivo_agonist_final))
+write.csv(REF_perf,paste0(output,'/02/Sensitivity and Specificity Predictions on Reference Chemicals.csv'))
+```
+
+```{r}
+# Preparation for the 2-tier approach
+# For each antagonist subset model investigate if there is a subset combination of assays that has better agonist sensitivity then the antagonist subset model itself.
+
+BEST_anta = unique(BEST9[,antagonist_subset_model])
+BEST_agon = unique(BEST9[,agonist_subset_model])
+BEST_anta
+BEST_agon
+
+cmbns_anta = list()
+k = 1
+for(i in BEST_anta){ # For each antagonist subset model...
+    x = sub('.', '',i) # ...remove "A"...
+    x_vector = as.vector(str_split_fixed(x, pattern = "", n = nchar(x))) # ...split binary representation...
+    x_1 = which(x_vector=='1') # ...find which element/assay is 1?
+    
+    for(j in 1:(length(x_1)-1)){ # at each iteration increase the number of assays (remove the final as it is the same as the original antagonist subset model)...
+        m = t(combn(x_1,j+1)) # ...create all combinations...
+        if(nrow(m)>1){ 
+            # create binary representation following x_1
+            m1 = t(apply(m, 1, tabulate, nbins = 14))
+            m1 = cbind(m1,original_submodel.x=i)
+            cmbns_anta[[k]] = m1
+            k=k+1 
+        }
+    }
+}
+
+cmbns_anta_2 = do.call(rbind, cmbns_anta)
+DT_cmbns_anta = as.data.frame(cmbns_anta_2)
+DT_cmbns_anta = cbind(V0 = 'A', DT_cmbns_anta)
+# columns to paste together
+cols = colnames(DT_cmbns_anta)
+cols = head(cols,-1)
+DT_cmbns_anta$subsets_submodel.x <- apply( DT_cmbns_anta[ , cols ] , 1 , paste , collapse = "" )
+DT_cmbns_anta = setDT(DT_cmbns_anta)
+DT_cmbns_anta_ALL_vs_FULL = merge(DT_cmbns_anta,unique(ALL_vs_FULL[,.(submodel.x,sens.Agonist.allchem,spec.Agonist.allchem,assays)]),by.x = 'subsets_submodel.x',by.y = 'submodel.x',all.x = TRUE)
+DT_cmbns_anta_ALL_vs_FULL_2 = merge(DT_cmbns_anta_ALL_vs_FULL,unique(ALL_vs_FULL[,.(submodel.x,sens.Antagonist.allchem,spec.Antagonist.allchem,assays)]),by.x = 'original_submodel.x',by.y = 'submodel.x',all.x = TRUE)
+#,
+# Calculate the number of assays within the subset model.
+#DT_cmbns_anta_ALL_vs_FULL_2[,'original_assays':=stringr::str_replace(original_submodel.x, "A", "")]
+#DT_cmbns_anta_ALL_vs_FULL_2$original_assays = sapply(strsplit(DT_cmbns_anta_ALL_vs_FULL_2$original_assays, ""), function(x) sum(as.integer(x)))
+
+setnames(DT_cmbns_anta_ALL_vs_FULL_2,
+         old=c('sens.Agonist.allchem','spec.Agonist.allchem','assays.x','sens.Antagonist.allchem','spec.Antagonist.allchem','assays.y'),
+         new=c('subsets_sens.Agonist.allchem','subsets_spec.Agonist.allchem','subsets_assays','original_sens.Antagonist.allchem','original_spec.Antagonist.allchem','original_assays'))
+
+DT_cmbns_anta_ALL_vs_FULL_3 = DT_cmbns_anta_ALL_vs_FULL_2[,(cols):=NULL]
+
+DT_cmbns_anta_ALL_vs_FULL_3 = DT_cmbns_anta_ALL_vs_FULL_3[order(original_assays,-subsets_sens.Agonist.allchem,-subsets_spec.Agonist.allchem)]
+
+write.csv(DT_cmbns_anta_ALL_vs_FULL_3,paste0(output,'/02/2-tier subset models.csv'))
+
+BEST_2_tier = rbindlist(
+    
+    list(DT_cmbns_anta_ALL_vs_FULL_3[order(original_assays,-subsets_sens.Agonist.allchem,-subsets_spec.Agonist.allchem)][original_assays==5][1],
+         DT_cmbns_anta_ALL_vs_FULL_3[order(original_assays,-subsets_sens.Agonist.allchem,-subsets_spec.Agonist.allchem)][original_assays==6][1],
+         DT_cmbns_anta_ALL_vs_FULL_3[order(original_assays,-subsets_sens.Agonist.allchem,-subsets_spec.Agonist.allchem)][original_assays==7][1],
+         DT_cmbns_anta_ALL_vs_FULL_3[order(original_assays,-subsets_sens.Agonist.allchem,-subsets_spec.Agonist.allchem)][original_assays==8][1],
+         DT_cmbns_anta_ALL_vs_FULL_3[order(original_assays,-subsets_sens.Agonist.allchem,-subsets_spec.Agonist.allchem)][original_assays==9][1])
+
+)
+```
+
+
+```{r}
+B9_anta = unique(ALL_vs_FULL[amask %in% BEST_anta,.(amask,assays,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)])
+```
+
+```{r}
+B9_anta_melt = melt(B9_anta, 
+                    id.vars = c("amask", "assays"),
+                    measure.vars = c("sens.Antagonist.allchem", "spec.Antagonist.allchem","sens.Agonist.allchem","spec.Agonist.allchem"),
+                    variable.name = "variable", value.name = "value")
+B9_anta_melt[,c('value','mode'):=.(100*value,'Antagonist')]
+B9_anta_melt[variable=='sens.Antagonist.allchem',c('metric','mode'):=.("Antagonist Sensitivity for all chemicals","Antagonist")]
+B9_anta_melt[variable=='spec.Antagonist.allchem',c('metric','mode'):=.("Antagonist Specificity for all chemicals","Antagonist")]
+B9_anta_melt[variable=='sens.Agonist.allchem',c('metric','mode'):=.("Agonist Sensitivity for all chemicals","Agonist")]
+B9_anta_melt[variable=='spec.Agonist.allchem',c('metric','mode'):=.("Agonist Specificity for all chemicals","Agonist")]
+```
+
+```{r}
+B9_agon = unique(ALL_vs_FULL[amask %in% BEST_agon,.(amask,assays,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)])
+```
+
+```{r}
+B9_agon_melt = melt(B9_agon, 
+                    id.vars = c("amask", "assays"),
+                    measure.vars = c("sens.Antagonist.allchem", "spec.Antagonist.allchem","sens.Agonist.allchem","spec.Agonist.allchem"),
+                    variable.name = "variable", value.name = "value")
+B9_agon_melt[,c('value','mode'):=.(100*value,'Agonist')]
+B9_agon_melt[variable=='sens.Antagonist.allchem',c('metric','mode'):=.("Antagonist Sensitivity for all chemicals","Antagonist")]
+B9_agon_melt[variable=='spec.Antagonist.allchem',c('metric','mode'):=.("Antagonist Specificity for all chemicals","Antagonist")]
+B9_agon_melt[variable=='sens.Agonist.allchem',c('metric','mode'):=.("Agonist Sensitivity for all chemicals","Agonist")]
+B9_agon_melt[variable=='spec.Agonist.allchem',c('metric','mode'):=.("Agonist Specificity for all chemicals","Agonist")]
+```
+
+```{r}
+#setnames(B9_agon_melt,old=c("agonist_subset_model","n_assays_agon"),new=c("amask","assays"))
+#setnames(B9_anta_melt,old=c("antagonist_subset_model","n_assays_anta"),new=c("amask","assays"))
+```
+
+```{r}
+B9 = rbindlist(list(B9_agon_melt,B9_anta_melt))
+```
+
+```{r}
+remove_amask = B9[metric=="Agonist Sensitivity for all chemicals" & value<50,amask]
+remove_amask
+```
+
+```{r}
+B9 = B9[!(amask %in% remove_amask),]
+```
+
+```{r}
+lvls = B9[metric=='Agonist Sensitivity for all chemicals'][order(value)]$amask
+```
+
+```{r}
+p = ggplot(B9, aes(x=factor(amask,levels=lvls), y=value, shape = metric, color=mode, label = assays)) +
+    labs(#title = "Performance of subset models without receptor binding assays", 
+         x="Subset models", y="Metric values (%)") +
+    geom_point(size=1.5) + 
+    theme(axis.text.x=element_text(size=5,angle=90),
+          axis.title=element_text(size=14,face="bold"),
+          plot.title=element_text(size=14,face="bold",hjust=0.5),
+          legend.position="bottom", 
+          legend.direction="vertical") +
+    coord_cartesian(ylim = c(50,100))  
+#    geom_text(vjust=2, 
+#              hjust=0,
+#              aes(label = assays), 
+#              data = subset(Antagonist_criterion_melt_no_NVS[amask %in% no_NVS], metric == "Antagonist Sensitivity for all chemicals" | metric == "Agonist Sensitivity for all chemicals"),  
+#              size=2, 
+#              color = "black", 
+#              angle=0)
+ggsave(paste0(figures,"/02/Subset models relevant for the 9 assay battery.pdf"), p, width=8, height=5)
+p
+```
+
+```{r}
+# 3.5 COMPARE ANTAGONIST MODELS
+CMP_ANTA_all = unique(ALL_vs_FULL[submodel.x %in% c('A00101000000111','A00001010000111','A00001000001111','A00001001000111') & FN.Antagonist==1,
+                                  .(CASRN,code,sens.Antagonist.allchem=round(sens.Antagonist.allchem,3),spec.Antagonist.allchem=round(spec.Antagonist.allchem,3),
+                                                                                      sens.Agonist.allchem=round(sens.Agonist.allchem,3),spec.Agonist.allchem=round(spec.Agonist.allchem,3),
+                                                                                      TP.Antagonist,FP.Antagonist,TN.Antagonist,FN.Antagonist,
+                                                                                      TP.Agonist,FP.Agonist,TN.Agonist,FN.Agonist
+                                                                                     ),by=submodel.x][order(-sens.Antagonist.allchem,-spec.Antagonist.allchem)])
+
+CMP_ANTA = unique(ALL_vs_FULL[submodel.x %in% c('A00101000000111','A00001010000111','A00001000001111','A00001001000111'),.(sens.Antagonist.allchem=round(sens.Antagonist.allchem,3),
+                                                                                  spec.Antagonist.allchem=round(spec.Antagonist.allchem,3),
+                                                                                  #sens.Agonist.allchem=round(sens.Agonist.allchem,3),
+                                                                                  #spec.Agonist.allchem=round(spec.Agonist.allchem,3),
+                                                                                  TP.anta=sum(TP.Antagonist),FP.anta=sum(FP.Antagonist),
+                                                                                  TN.anta=sum(TN.Antagonist),FN.anta=sum(FN.Antagonist)),
+                                                                                  #TP.agon=sum(TP.Agonist),FP.agon=sum(FP.Agonist),
+                                                                                  #TN.agon=sum(TN.Agonist),FN.agon=sum(FN.Agonist)),
+                              by=submodel.x][order(-sens.Antagonist.allchem,-spec.Antagonist.allchem)])
+CMP_ANTA
+```
+
+```{r}
+# 3.6.1 What chemicals are predicted as FN?
+
+# Identifying “bad actor” chemicals - 
+# These are chemicals for which the full model predicted positive agonist or antagonist effect, 
+# but the subset model predicted no effect. In other words, we want to find chemicals for which 
+# the subset model made false negative (FN) predictions and check in which clusters they are present.
+    
+FN_Antagonist = unique(ALL_vs_FULL[submodel.x == CMP_ANTA$submodel.x[1] & FN.Antagonist==1,.(code,CASRN,name,TP.Antagonist,FP.Antagonist,
+                                                                                             TN.Antagonist,FN.Antagonist,TP.Agonist,
+                                                                                             FP.Agonist,TN.Agonist,FN.Agonist)])
+FN_Antagonist
+unique(ALL_vs_FULL[submodel.x %in% CMP_ANTA$submodel.x & FN.Antagonist==1,.(code,CASRN,name)])
+```
+
+```{r}
+cat('Number of antagonist chemicals:\n',length(unique(ALL_vs_FULL[submodel.x == submodel.y & AUC.Antagonist.y.bin==1,CASRN])),'\n')
+cat('Number of agonist chemicals:\n',length(unique(ALL_vs_FULL[submodel.x == submodel.y & AUC.Agonist.y.bin==1,CASRN])),'\n')
+```
+
+```{r}
+FN_Agonist = unique(ALL_vs_FULL[submodel.x == 'A00101011101000' & FN.Agonist==1,.(code,CASRN,name,TP.Agonist,
+                                                                                             FP.Agonist,TN.Agonist,FN.Agonist)])
+FN_Agonist
+```
+
+```{r}
+# 3.2. INFLUENCE OF LOSS OF ASSAYS
+Sens_spec_performance = unique(ALL_vs_FULL[order(-sens.Antagonist.allchem,-spec.Antagonist.allchem,assays),.(amask,assays,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)])
+```
+
+```{r}
+Sens_spec_performance[,"NVS_NR_hAR":=0]
+Sens_spec_performance[,"NVS_NR_cAR":=0]
+Sens_spec_performance[,"NVS_NR_rAR":=0]
+Sens_spec_performance[,"OT_AR_ARSRC1_0480":=0]
+Sens_spec_performance[,"OT_AR_ARSRC1_0960":=0]
+Sens_spec_performance[,"UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist":=0]
+Sens_spec_performance[,"ATG_AR_TRANS_up":=0]
+Sens_spec_performance[,"OT_AR_ARELUC_AG_1440":=0]
+Sens_spec_performance[,"TOX21_AR_BLA_Agonist_ratio":=0]
+Sens_spec_performance[,"TOX21_AR_LUC_MDAKB2_Agonist":=0]
+Sens_spec_performance[,"ACEA_AR_agonist_80hr":=0]
+Sens_spec_performance[,"UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist":=0]
+Sens_spec_performance[,"TOX21_AR_BLA_Antagonist_ratio":=0]
+Sens_spec_performance[,"TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881":=0]
+```
+
+```{r}
+tmpFtion1=function(a){
+    return(strsplit(a,"")[[1]])
+}
+```
+
+```{r}
+# ID if an assay is present in "amask"
+Sens_spec_performance[,"NVS_NR_hAR":=ifelse(tmpFtion1(amask)[2]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"NVS_NR_cAR":=ifelse(tmpFtion1(amask)[3]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"NVS_NR_rAR":=ifelse(tmpFtion1(amask)[4]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"OT_AR_ARSRC1_0480":=ifelse(tmpFtion1(amask)[5]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"OT_AR_ARSRC1_0960":=ifelse(tmpFtion1(amask)[6]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist":=ifelse(tmpFtion1(amask)[7]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"ATG_AR_TRANS_up":=ifelse(tmpFtion1(amask)[8]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"OT_AR_ARELUC_AG_1440":=ifelse(tmpFtion1(amask)[9]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"TOX21_AR_BLA_Agonist_ratio":=ifelse(tmpFtion1(amask)[10]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"TOX21_AR_LUC_MDAKB2_Agonist":=ifelse(tmpFtion1(amask)[11]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"ACEA_AR_agonist_80hr":=ifelse(tmpFtion1(amask)[12]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist":=ifelse(tmpFtion1(amask)[13]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"TOX21_AR_BLA_Antagonist_ratio":=ifelse(tmpFtion1(amask)[14]=="1",1,0),by=.(amask)]
+Sens_spec_performance[,"TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881":=ifelse(tmpFtion1(amask)[15]=="1",1,0),by=.(amask)]
+```
+
+```{r}
+# Define assay types.
+Sens_spec_performance[,'Receptor Binding':=ifelse(NVS_NR_hAR==1 | NVS_NR_cAR==1 | NVS_NR_rAR==1, 1, 0)]
+Sens_spec_performance[,'Coregulator Recruitment':=ifelse(OT_AR_ARSRC1_0480==1 | OT_AR_ARSRC1_0960==1, 1, 0)]
+Sens_spec_performance[,'Nuclear Translocation':=ifelse(UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist==1 | UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist ==1,1,0)]
+Sens_spec_performance[,'RNA Reporter Gene':=ifelse(ATG_AR_TRANS_up==1, 1,0)]
+Sens_spec_performance[,'Reporter Gene':=ifelse(OT_AR_ARELUC_AG_1440==1 |
+                                                   TOX21_AR_BLA_Agonist_ratio==1 | 
+                                                   TOX21_AR_LUC_MDAKB2_Agonist==1 | 
+                                                   TOX21_AR_BLA_Antagonist_ratio==1 | 
+                                                   TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881==1,1,0)]
+Sens_spec_performance[,'Real-time impedance':=ifelse(ACEA_AR_agonist_80hr==1,1,0)]
+```
+
+```{r}
+# 1. Losing_Receptor_Binding_Assays
+Losing_Receptor_Binding_Assays = Sens_spec_performance[`Receptor Binding`==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assays[,c("Loss of","Assay ID"):=.("All Receptor Binding Assays (on Antagonist (3/9) and Agonist (3/11) pathway)","A1, A2, and A3")]
+Losing_Receptor_Binding_Assay1 = Sens_spec_performance[NVS_NR_hAR==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assay1[,c("Loss of","Assay ID"):=.("Receptor Binding Assay NVS_NR_hAR (on Antagonist and Agonist pathway)","A1")]
+Losing_Receptor_Binding_Assay2 = Sens_spec_performance[NVS_NR_cAR==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assay2[,c("Loss of","Assay ID"):=.("Receptor Binding Assay NVS_NR_cAR (on Antagonist and Agonist pathway)","A2")]
+Losing_Receptor_Binding_Assay3 = Sens_spec_performance[NVS_NR_rAR==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assay3[,c("Loss of","Assay ID"):=.("Receptor Binding Assay NVS_NR_rAR (on Antagonist and Agonist pathway)","A3")]
+
+# 2. Losing Coregulator Recruitment Assays
+Losing_Coregulator_Recruitment_Assay1 = Sens_spec_performance[OT_AR_ARSRC1_0480==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Coregulator_Recruitment_Assay1[,c("Loss of","Assay ID"):=.("Coregulator Recruitment Assay OT_AR_ARSRC1_0480 (on Antagonist and Agonist pathway)","A4")]
+Losing_Coregulator_Recruitment_Assay2 = Sens_spec_performance[OT_AR_ARSRC1_0960==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Coregulator_Recruitment_Assay2[,c("Loss of","Assay ID"):=.("Coregulator Recruitment Assay OT_AR_ARSRC1_0960 (on Antagonist and Agonist pathway)","A5")]
+
+# 3. Losing Nuclear Translocation Assays
+# Losing UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist
+Losing_Nuclear_Translocation_Assays1 = Sens_spec_performance[UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Nuclear_Translocation_Assays1[,c("Loss of","Assay ID"):=.("Nuclear Translocation Assay UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist (on Antagonist and Agonist pathway)","A6")]
+# Losing UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist!!!
+Losing_Nuclear_Translocation_Assays2 = Sens_spec_performance[UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Nuclear_Translocation_Assays2[,c("Loss of","Assay ID"):=.("Nuclear Translocation Assay UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist (on Antagonist pathway)","A12")]
+
+# 4. Losing RNA Reporter Gene Assays
+Losing_RNA_Reporter_Gene_Assays = Sens_spec_performance[`RNA Reporter Gene`==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_RNA_Reporter_Gene_Assays[,c("Loss of","Assay ID"):=.("RNA Reporter Gene Assays (ATG_AR_TRANS_up) (on Agonist pathway)","A7")]
+
+# 5. Losing Reporter Gene Assays
+Losing_Reporter_Gene_Assays51 = Sens_spec_performance[OT_AR_ARELUC_AG_1440==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays51[,c("Loss of","Assay ID"):=.("Reporter Gene Assay OT_AR_ARELUC_AG_1440 (on Agonist pathway)","A8")]
+Losing_Reporter_Gene_Assays52 = Sens_spec_performance[TOX21_AR_BLA_Agonist_ratio==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays52[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_BLA_Agonist_ratio (on Agonist pathway)","A9")]
+Losing_Reporter_Gene_Assays53 = Sens_spec_performance[TOX21_AR_LUC_MDAKB2_Agonist==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays53[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_LUC_MDAKB2_Agonist (on Agonist pathway)","A10")]
+Losing_Reporter_Gene_Assays54 = Sens_spec_performance[TOX21_AR_BLA_Antagonist_ratio==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays54[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_BLA_Antagonist_ratio ( on Antagonist pathway)","A13")]
+###################
+Losing_Reporter_Gene_Assays55 = Sens_spec_performance[TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays55[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881 (on Antagonist pathway)","A14")]
+###################
+# 6. Losing Real-time impedance Assays
+Losing_Real_time_impedance_Assay = Sens_spec_performance[`Real-time impedance`==0,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Real_time_impedance_Assay[,c("Loss of","Assay ID"):=.("Real-time impedance Assay (ACEA_AR_agonist_80hr) (on Agonist pathway)","A11")]
+```
+
+```{r}
+Losing_Assays = rbindlist(list(Losing_Receptor_Binding_Assays,
+                               Losing_Receptor_Binding_Assay1,
+                               Losing_Receptor_Binding_Assay2,
+                               Losing_Receptor_Binding_Assay3,
+                               Losing_Coregulator_Recruitment_Assay1,
+                               Losing_Coregulator_Recruitment_Assay2,
+                               Losing_Nuclear_Translocation_Assays1,
+                               Losing_RNA_Reporter_Gene_Assays,
+                               Losing_Reporter_Gene_Assays51,
+                               Losing_Reporter_Gene_Assays52,
+                               Losing_Reporter_Gene_Assays53,
+                               Losing_Real_time_impedance_Assay,
+                               Losing_Nuclear_Translocation_Assays2,
+                               Losing_Reporter_Gene_Assays54,
+                               Losing_Reporter_Gene_Assays55))
+```
+
+```{r}
+Losing_Assays[,c("max Antagonist Sensitivity","max Agonist Sensitivity"):=
+                  .(max(sens.Antagonist.allchem),max(sens.Agonist.allchem)),by=.(`Loss of`)]
+```
+
+```{r}
+Losing_Assays = unique(Losing_Assays[,c("Assay ID","Loss of","max Antagonist Sensitivity","max Agonist Sensitivity")])
+Losing_Assays
+```
+
+```{r}
+# Apply EPA's criterion for practical use of AR subset models.
+# 1. Losing_Receptor_Binding_Assays
+Losing_Receptor_Binding_Assays_crit = Sens_spec_performance[`Receptor Binding`==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assays_crit[,c("Loss of","Assay ID"):=.("All Receptor Binding Assays (on Antagonist (3/9) and Agonist (3/11) pathway)","A1, A2, and A3")]
+Losing_Receptor_Binding_Assay1_crit = Sens_spec_performance[NVS_NR_hAR==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assay1_crit[,c("Loss of","Assay ID"):=.("Receptor Binding Assay NVS_NR_hAR (on Antagonist and Agonist pathway)","A1")]
+Losing_Receptor_Binding_Assay2_crit = Sens_spec_performance[NVS_NR_cAR==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assay2_crit[,c("Loss of","Assay ID"):=.("Receptor Binding Assay NVS_NR_cAR (on Antagonist and Agonist pathway)","A2")]
+Losing_Receptor_Binding_Assay3_crit = Sens_spec_performance[NVS_NR_rAR==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Receptor_Binding_Assay3_crit[,c("Loss of","Assay ID"):=.("Receptor Binding Assay NVS_NR_rAR (on Antagonist and Agonist pathway)","A3")]
+
+# 2. Losing Coregulator Recruitment Assays
+Losing_Coregulator_Recruitment_Assay1_crit = Sens_spec_performance[OT_AR_ARSRC1_0480==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Coregulator_Recruitment_Assay1_crit[,c("Loss of","Assay ID"):=.("Coregulator Recruitment Assay OT_AR_ARSRC1_0480 (on Antagonist and Agonist pathway)","A4")]
+Losing_Coregulator_Recruitment_Assay2_crit = Sens_spec_performance[OT_AR_ARSRC1_0960==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Coregulator_Recruitment_Assay2_crit[,c("Loss of","Assay ID"):=.("Coregulator Recruitment Assay OT_AR_ARSRC1_0960 (on Antagonist and Agonist pathway)","A5")]
+
+# 3. Losing Nuclear Translocation Assays
+# Losing UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist
+Losing_Nuclear_Translocation_Assays1_crit = Sens_spec_performance[UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Nuclear_Translocation_Assays1_crit[,c("Loss of","Assay ID"):=.("Nuclear Translocation Assay UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist (on Antagonist and Agonist pathway)","A6")]
+# Losing UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist!!!
+Losing_Nuclear_Translocation_Assays2_crit = Sens_spec_performance[UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Nuclear_Translocation_Assays2_crit[,c("Loss of","Assay ID"):=.("Nuclear Translocation Assay UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist (on Antagonist pathway)","A12")]
+
+# 4. Losing RNA Reporter Gene Assays
+Losing_RNA_Reporter_Gene_Assays_crit = Sens_spec_performance[`RNA Reporter Gene`==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_RNA_Reporter_Gene_Assays_crit[,c("Loss of","Assay ID"):=.("RNA Reporter Gene Assays (ATG_AR_TRANS_up) (on Agonist pathway)","A7")]
+
+# 5. Losing Reporter Gene Assays
+Losing_Reporter_Gene_Assays51_crit = Sens_spec_performance[OT_AR_ARELUC_AG_1440==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays51_crit[,c("Loss of","Assay ID"):=.("Reporter Gene Assay OT_AR_ARELUC_AG_1440 (on Agonist pathway)","A8")]
+Losing_Reporter_Gene_Assays52_crit = Sens_spec_performance[TOX21_AR_BLA_Agonist_ratio==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays52_crit[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_BLA_Agonist_ratio (on Agonist pathway)","A9")]
+Losing_Reporter_Gene_Assays53_crit = Sens_spec_performance[TOX21_AR_LUC_MDAKB2_Agonist==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays53_crit[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_LUC_MDAKB2_Agonist (on Agonist pathway)","A10")]
+Losing_Reporter_Gene_Assays54_crit = Sens_spec_performance[TOX21_AR_BLA_Antagonist_ratio==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays54_crit[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_BLA_Antagonist_ratio ( on Antagonist pathway)","A13")]
+###################
+Losing_Reporter_Gene_Assays55_crit = Sens_spec_performance[TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Reporter_Gene_Assays55_crit[,c("Loss of","Assay ID"):=.("Reporter Gene Assay TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881 (on Antagonist pathway)","A14")]
+###################
+# 6. Losing Real-time impedance Assays
+Losing_Real_time_impedance_Assay_crit = Sens_spec_performance[`Real-time impedance`==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.95,.(amask,assays,sens.Antagonist.allchem,sens.Agonist.allchem)]
+Losing_Real_time_impedance_Assay_crit[,c("Loss of","Assay ID"):=.("Real-time impedance Assay (ACEA_AR_agonist_80hr) (on Agonist pathway)","A11")]
+```
+
+```{r}
+Losing_Assays_crit = rbindlist(list(Losing_Receptor_Binding_Assays_crit,
+                                    Losing_Receptor_Binding_Assay1_crit,
+                                    Losing_Receptor_Binding_Assay2_crit,
+                                    Losing_Receptor_Binding_Assay3_crit,
+                                    Losing_Coregulator_Recruitment_Assay1_crit,
+                                    Losing_Coregulator_Recruitment_Assay2_crit,
+                                    Losing_Nuclear_Translocation_Assays1_crit,
+                                    Losing_RNA_Reporter_Gene_Assays_crit,
+                                    Losing_Reporter_Gene_Assays51_crit,
+                                    Losing_Reporter_Gene_Assays52_crit,
+                                    Losing_Reporter_Gene_Assays53_crit,
+                                    Losing_Real_time_impedance_Assay_crit,
+                                    Losing_Nuclear_Translocation_Assays2_crit,
+                                    Losing_Reporter_Gene_Assays54_crit,
+                                    Losing_Reporter_Gene_Assays55_crit))
+```
+
+```{r}
+Losing_Assays_crit[,c("max Antagonist Sensitivity","max Agonist Sensitivity"):=
+                       .(max(sens.Antagonist.allchem),max(sens.Agonist.allchem)),by=.(`Loss of`)]
+```
+
+```{r}
+Losing_Assays_crit = unique(Losing_Assays_crit[,c("Assay ID","Loss of","max Antagonist Sensitivity","max Agonist Sensitivity")])
+setnames(Losing_Assays_crit,
+         old = c("max Antagonist Sensitivity","max Agonist Sensitivity"),
+         new = c("max Antagonist Sensitivity criterion","max Agonist Sensitivity criterion"))
+Losing_Assays_crit
+```
+
+```{r}
+LA = plyr::join(Losing_Assays,Losing_Assays_crit,by = c("Assay ID","Loss of"))
+```
+
+```{r}
+LA
+```
+
+
+```{r}
+write.csv(LA,paste0(output,"/02/Performance_upon_losing_an_assay.csv"))
+```
+
+```{r}
+# 3.3 Influence of NVS assays removal.
+# Plot the best subset models for agonist and antagonist mode without NVS assays
+# Subset models without NVS assays
+# no_NVS = Losing_Receptor_Binding_Assays_crit$amask # I won't use this condition as the one below has more story to tell for results and discussion
+no_NVS = Sens_spec_performance[`Receptor Binding`==0 & spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.94,amask]
+```
+
+```{r}
+# For "no_NVS" assays figure (not for the analysis)
+# I lowered the criterion to get more subset models and stress A00001001111111, which has better Agonist sensitivity.
+Antagonist_criterion_no_NVS = ALL_vs_FULL[spec.Antagonist.allchem>0.85 & sens.Antagonist.allchem>0.94,
+                                   .(assays,amask,submodel.x,sens.Antagonist.allchem,spec.Antagonist.allchem,sens.Agonist.allchem,spec.Agonist.allchem)]
+
+Antagonist_criterion_no_NVS = unique(Antagonist_criterion_no_NVS)
+
+Antagonist_criterion_no_NVS = Antagonist_criterion_no_NVS[order(-sens.Antagonist.allchem,assays,spec.Antagonist.allchem),] # order
+
+Antagonist_criterion_no_NVS$amask = factor(Antagonist_criterion_no_NVS$amask, levels=unique(Antagonist_criterion_no_NVS$amask)) # Convert "amask" into factors, and melt. This is done for plotting purposes.
+```
+
+```{r}
+# for "no_NVS" assays figure
+Antagonist_criterion_melt_no_NVS =  melt(Antagonist_criterion_no_NVS,
+                                         id.vars = c("amask", "assays"),
+                                         measure.vars = c("sens.Antagonist.allchem","spec.Antagonist.allchem","sens.Agonist.allchem","spec.Agonist.allchem")
+                                         )
+```
+
+```{r}
+# For "no_NVS" assays figure
+Antagonist_criterion_melt_no_NVS[,mode:=ifelse(grepl('Antagonist',variable),'Antagonist','Agonist')] # For plotting purpose
+```
+
+```{r}
+# for "no_NVS" assays figure
+Antagonist_criterion_melt_no_NVS[variable == 'sens.Antagonist.allchem',metric:='Antagonist Sensitivity for all chemicals'] # For plotting purpose
+Antagonist_criterion_melt_no_NVS[variable == 'spec.Antagonist.allchem',metric:='Antagonist Specificity for all chemicals'] # For plotting purpose
+Antagonist_criterion_melt_no_NVS[variable == 'sens.Agonist.allchem',metric:='Agonist Sensitivity for all chemicals'] # For plotting purpose
+Antagonist_criterion_melt_no_NVS[variable == 'spec.Agonist.allchem',metric:='Agonist Specificity for all chemicals'] # For plotting purpose
+```
+
+```{r}
+# for "no_NVS" assays figure
+Antagonist_criterion_melt_no_NVS = unique(Antagonist_criterion_melt_no_NVS)
+```
+
+```{r}
+# for "no_NVS" assays figure
+Antagonist_criterion_melt_no_NVS[,value:=100*value]
+```
+
+```{r}
+p = ggplot(Antagonist_criterion_melt_no_NVS[amask %in% no_NVS], aes(x=amask, y=value, shape = metric, color=mode, label = assays)) +
+    labs(title = "Performance of subset models without receptor binding assays", x="Subset models", y="Metric values (%)") +
+    geom_point(size=1.5) + 
+    theme(axis.text.x=element_text(size=5,angle=90),
+          axis.title=element_text(size=14,face="bold"),
+          plot.title=element_text(size=14,face="bold",hjust=0.5),
+          legend.position="bottom", 
+          legend.direction="vertical") +
+    coord_cartesian(ylim = c(72.5,100)) + 
+    geom_text(vjust=2, 
+              hjust=0,
+              aes(label = assays), 
+              data = subset(Antagonist_criterion_melt_no_NVS[amask %in% no_NVS], metric == "Antagonist Sensitivity for all chemicals" | metric == "Agonist Sensitivity for all chemicals"),  
+              size=2, 
+              color = "black", 
+              angle=0)
+ggsave(paste0(figures,"/02/Best AR Models without NVS assays.pdf"), p, width=8, height=5)
+p
+```
+
+
+```{r}
+# 4. Introduce clusters
+```
+
+```{r}
+#c_height = 1.0
+edsp = fread(paste0(input, "/EDSP_cluster_assignment_cut_height_",c_height,".tsv"))
+```
+
+```{r}
+cat('Number of clusters:\n',length(unique(edsp$cluster_id)))
+```
+
+```{r}
+# Number of chemicals in the EDSP UoC (inc. components of mixtures)
+cat('Some of these ',length(unique(edsp$DTXSID)),' DTXSIDs are components of mixtures.\n')
+cat('The number of unique SMILES:',length(unique(edsp$SMILES)),'\n')
+length(unique(edsp$DTXCID))
+length(unique(edsp$CASRN))
+```
+
+```{r}
+write.csv(edsp[,.(DTXSID,SMILES)],paste0(output,"/edsp.csv"))
+```
+
+```{r}
+# Read in cluster assignments for ToxCast chemicals.
+tc = fread(paste0(input,"/Toxcast_cluster_assignments_cut_height_",c_height,".tsv"))
+tc[,clus_prediction:=as.character(clus_prediction)]
+```
+
+```{r}
+# Total number of clusters in "Toxcast_cluster_assignments_cut_height_1.tsv"
+cat('The total number of clusters in "Toxcast_cluster_assignments_cut_height_1.tsv is:"',length(unique(tc$clus_prediction)),'\n')
+```
+
+```{r}
+# From a list of 1820 chemicals (Judson et al., 2020), 69 do not have a matching CASRN in "Toxcast_cluster_assignments_cut_height_1.tsv".
+# These chemicals didn't have SMILES or QSAR-ready SMILES structures
+not_in_tc = unique(ALL_vs_FULL$CASRN[!(ALL_vs_FULL$CASRN %in% tc$CASRN)])
+not_in_tc
+#not_in_tc[not_in_tc %in% edsp$CASRN] # double check
+```
+
+```{r}
+# All other chemicals do have corresponding cluster number/ID.
+sum(unique(ALL_vs_FULL[!CASRN %in% not_in_tc,CASRN]) %in% tc$CASRN)
+```
+
+```{r}
+# From 716 clusters, 561 clusters contain chemicals in the AR paper.
+length(unique(tc[CASRN %in% unique(ALL_vs_FULL[!CASRN %in% not_in_tc,CASRN]),clus_prediction]))
+```
+
+```{r}
+# Add cluster information
+ALL_vs_FULL_clust = merge(x = ALL_vs_FULL,y = tc[,.(CASRN,DTXSID,clus_prediction,in_edsp_universe)], by = 'CASRN', all.x = TRUE)
+```
+
+```{r}
+# An estimate of the RAM memory usage
+print(object.size(ALL_vs_FULL), units = "Mb")
+dim(ALL_vs_FULL)
+#rm(ALL_vs_FULL)
+```
+
+```{r}
+cat('The number of chemicals:',length(unique(ALL_vs_FULL_clust$code)))
+```
+
+```{r}
+# The rest of the analysis is done clusters-based. 
+# Remove chemicals/rows without cluster IDs.
+ALL_vs_FULL_clust = ALL_vs_FULL_clust[!(CASRN %in% not_in_tc),]
+```
+
+```{r}
+# Check
+cat('The number of chemicals:',length(unique(ALL_vs_FULL_clust$code)),"\n")
+cat('The number of clusters:',length(unique(ALL_vs_FULL_clust$clus_prediction)),"\n")
+```
+
+```{r}
+sum(antagonists_AR %in% unique(ALL_vs_FULL_clust$code))
+sum(agonists_AR %in% unique(ALL_vs_FULL_clust$code))
+sum(both_AR %in% unique(ALL_vs_FULL_clust$code))
+```
+
+```{r}
+# Calculate the number of chemicals per cluster
+ALL_vs_FULL_clust[,'nchem_clus' := .N, .(submodel.x,clus_prediction)]
+```
+
+```{r}
+# Number of clusters with a particular number of chemicals
+ALL_vs_FULL_clust[,'nclust_nchem':=length(unique(clus_prediction)),by=.(nchem_clus)]
+```
+
+```{r}
+# Number of clusters with more that 1 chemical
+length(unique(ALL_vs_FULL_clust[nchem_clus>1,clus_prediction]))
+```
+
+```{r}
+length(unique(ALL_vs_FULL_clust[submodel.x=='A11111111111111'][AUC.Agonist.y.bin==0 & AUC.Antagonist.y.bin==0,code]))
+length(unique(ALL_vs_FULL_clust[submodel.x=='A11111111111111'][AUC.Agonist.y.bin==1 & AUC.Antagonist.y.bin==1,code]))
+length(unique(ALL_vs_FULL_clust[submodel.x=='A11111111111111'][AUC.Agonist.y.bin==0 & AUC.Antagonist.y.bin==1,code]))
+length(unique(ALL_vs_FULL_clust[submodel.x=='A11111111111111'][AUC.Agonist.y.bin==1 & AUC.Antagonist.y.bin==0,code]))
+```
+
+```{r}
+# Define sensitivity (=TP/(TP+FN)), specificity (=TN/(TN+FP)) for each subset model and each cluster in:
+# 1. Agonist mode
+ALL_vs_FULL_clust[,'sens.Agonist.clust' := sum(TP.Agonist)/(sum(TP.Agonist)+sum(FN.Agonist)),by = .(submodel.x,clus_prediction)]
+ALL_vs_FULL_clust[,'spec.Agonist.clust' := sum(TN.Agonist)/(sum(TN.Agonist)+sum(FP.Agonist)),by = .(submodel.x,clus_prediction)]
+
+# 2. Antagonist mode
+ALL_vs_FULL_clust[,'sens.Antagonist.clust' := sum(TP.Antagonist)/(sum(TP.Antagonist)+sum(FN.Antagonist)),by = .(submodel.x,clus_prediction)]
+ALL_vs_FULL_clust[,'spec.Antagonist.clust' := sum(TN.Antagonist)/(sum(TN.Antagonist)+sum(FP.Antagonist)),by = .(submodel.x,clus_prediction)]
+```
+
+```{r}
+#ALL_vs_FULL_clust[,'ba.Agonist.clust' := (sens.Agonist.clust+spec.Agonist.clust)/2.0]
+#ALL_vs_FULL_clust[,'ba.Antagonist.clust' := (sens.Antagonist.clust+spec.Antagonist.clust)/2.0]
+```
+
+```{r}
+# Performance of all subset models across all clusters 
+CLST_PERF = unique(ALL_vs_FULL_clust[,.(submodel.x,assays,clus_prediction,sens.Agonist.clust,spec.Agonist.clust,sens.Antagonist.clust,spec.Antagonist.clust)])
+```
+
+```{r}
+# Split AMASK
+CLST_PERF[,(split_AMASK):=splitAMASK(submodel.x),by=1:nrow(CLST_PERF)]
+```
+
+```{r}
+# 4.1 What chemicals are predicted as FN?
+
+# Identifying “bad actor” chemicals - 
+# These are chemicals for which the full model predicted positive agonist or antagonist effect, 
+# but the subset model predicted no effect. In other words, we want to find chemicals for which 
+# the subset model made false negative (FN) predictions and check in which clusters they are present.
+    
+FN_Antagonist = unique(ALL_vs_FULL[submodel.x == 'A00101000000111' & FN.Antagonist==1,.(code,CASRN,name)])
+FN_Antagonist
+```
+
+```{r}
+# There is 1 FN agonist
+FN_Agonist = unique(ALL_vs_FULL[submodel.x == 'A00101011101000' & FN.Agonist==1,.(code,CASRN,name)])
+FN_Agonist
+```
+
+```{r}
+# Find cluster specific subset models for FNs detection, i.e. are there any subset model (made of 9-assay battery) with specificity 1 in these 10 clusters?
+FN_Antagonist_tc = merge(x = FN_Antagonist,y = tc[,.(CASRN,DTXSID,clus_prediction,in_edsp_universe)], by = 'CASRN', all.x = TRUE)
+FN_Antagonist_tc[,n_bad_actors:=.N,by=clus_prediction]
+FN_Antagonist_tc_ALL_vs_FULL_clust = merge(FN_Antagonist_tc,unique(ALL_vs_FULL_clust[,.(clus_prediction,nchem_clus)]),by = 'clus_prediction', all.x = TRUE)
+```
+
+```{r}
+bad_antagonist_clusters = unique(FN_Antagonist_tc_ALL_vs_FULL_clust$clus_prediction)
+```
+
+```{r}
+BAD_ANTA_SOL = CLST_PERF[clus_prediction %in% bad_antagonist_clusters & (A1 == 0 & A2 == 0 & A4 == 0 & A6 == 0 & A10 ==0) & (!sens.Antagonist.clust<0.95 & !spec.Antagonist.clust<0.85),.(submodel.x,clus_prediction,sens.Antagonist.clust,spec.Antagonist.clust)]#[,head(.SD,1),by=clus_prediction]
+```
+
+```{r}
+bad_antagonist_clusters[!(bad_antagonist_clusters %in% unique(BAD_ANTA_SOL$clus_prediction))]
+```
+
+```{r}
+BAD_ANTA_SOL = BAD_ANTA_SOL[order(clus_prediction,sens.Antagonist.clust,-spec.Antagonist.clust)]
+```
+
+```{r}
+BAD_ANTA_SOL
+```
+
+```{r}
+write.csv(BAD_ANTA_SOL[order(clus_prediction,sens.Antagonist.clust,-spec.Antagonist.clust)],paste0(output,'/S2 - Improving screening using cluster tailored subset models.csv'))
+```
+
+```{r}
+# Calculate the number of assays within the subset model.
+BAD_ANTA_SOL[,'assays':=stringr::str_replace(submodel.x, "A", "")]
+BAD_ANTA_SOL$assays = sapply(strsplit(BAD_ANTA_SOL$assays, ""), function(x) sum(as.integer(x)))
+```
+
+```{r}
+BAD_ANTA_SOL[,'nchem_clus' := .N, .(submodel.x,clus_prediction)]
+```
+
+```{r}
+G1 = unique(ALL_vs_FULL_clust[clus_prediction %in% bad_antagonist_clusters & submodel.x %in% unique(BAD_ANTA_SOL$submodel.x),.(submodel.x,clus_prediction,sens.Antagonist.clust,spec.Antagonist.clust,assays,nchem_clus)]) # more than one chemicals in the cluster and defined sensitivity
+```
+
+```{r}
+# Heatmap: Subset models with sensitivity >95% and specificity >85% across clusters where Sensitivity is defined
+h = heatmap_fun(DT_in = G1, # more than one chemicals in the cluster and defined sensitivity
+                dcast_RHS = "clus_prediction",
+                dcast_value.var = "sens.Antagonist.clust",
+                sort_by = NULL,
+                heatmap_title = "Antagonist Mode - Sensitivity per Cluster",
+                label_rows_by = "submodel.x",
+                label_columns_by = NULL,
+                split_rows_by = "assays",
+                split_columns_by = "nchem_clus",
+                colormap_type = "continuous",
+                color_lims = c(0,1),
+                colormap_base = viridisLite::viridis(11),
+                Heatmap_args = list(row_title_rot = 0,
+                                    row_title_gp = grid::gpar(fontsize=12),
+                                    column_title_rot = 0,
+                                    column_title_gp = grid::gpar(fontsize=12),
+                                    column_names_rot = 90,
+                                    column_names_gp = grid::gpar(fontsize=12),
+                                    row_names_gp = grid::gpar(fontsize = 2),
+                                    row_gap = grid::unit(0.5, "line"),
+                                    show_row_dend = TRUE,
+                                    show_column_dend = TRUE,
+                                    heatmap_legend_param = list(legend_direction = "horizontal")
+                                    )
+                )
+
+# pdf(paste0(figures,"/02/Heatmap_sens_antagonist.pdf"),height=10,width=16)
+# ComplexHeatmap::draw(h, heatmap_legend_side="top")
+# dev.off()
+
+svg(paste0(figures,"/02/Figure 7 - Improving screening using cluster tailored subset models.svg"),height=10,width=7)
+ComplexHeatmap::draw(h, heatmap_legend_side="top")
+dev.off()
+h
+rm(h)
+```
+
+```{r}
+# A00101000000111
+# A0 01010 0 0 0  0  0111
+#  1,2,4,6,7,8,9,10,11
+BAD_ANTA_SOL_2 = CLST_PERF[clus_prediction %in% bad_antagonist_clusters & (A1 == 0 & A2 == 0 & A4 == 0 & A6 == 0 & A7==0 & A8==0 & A9==0 & A10==0 & A11==0),.(submodel.x,clus_prediction,sens.Antagonist.clust,spec.Antagonist.clust)]#[,head(.SD,1),by=clus_prediction]
+```
+
+```{r}
+SM = BAD_ANTA_SOL_2[order(-sens.Antagonist.clust,spec.Antagonist.clust),head(.SD,3),by=clus_prediction][,.(clus_prediction,submodel.x)]
+```
+
+```{r}
+SM
+```
+
+```{r}
+G2 = unique(ALL_vs_FULL_clust[clus_prediction %in% bad_antagonist_clusters & submodel.x %in% unique(SM$submodel.x),.(submodel.x,clus_prediction,sens.Antagonist.clust,spec.Antagonist.clust,assays,nchem_clus)])
+```
+
+```{r}
+# Calculate the number of assays within the subset model.
+# G2[,'assays':=stringr::str_replace(submodel.x, "A", "")]
+# G2$assays = sapply(strsplit(G2$assays, ""), function(x) sum(as.integer(x)))
+# G2[,'nchem_clus' := .N, .(submodel.x,clus_prediction)]
+G2
+```
+
+```{r}
+# Heatmap: Subset models with sensitivity >95% and specificity >85% across clusters where Sensitivity is defined
+h = heatmap_fun(DT_in = G2, # more than one chemicals in the cluster and defined sensitivity
+                dcast_RHS = "clus_prediction",
+                dcast_value.var = "sens.Antagonist.clust",
+                sort_by = NULL,
+                heatmap_title = "Antagonist Mode - Sensitivity per Cluster",
+                label_rows_by = "submodel.x",
+                label_columns_by = NULL,
+                split_rows_by = "assays",
+                split_columns_by = "nchem_clus",
+                colormap_type = "continuous",
+                color_lims = c(0,1),
+                colormap_base = viridisLite::viridis(11),
+                Heatmap_args = list(row_title_rot = 0,
+                                    row_title_gp = grid::gpar(fontsize=12),
+                                    column_title_rot = 0,
+                                    column_title_gp = grid::gpar(fontsize=12),
+                                    column_names_rot = 90,
+                                    column_names_gp = grid::gpar(fontsize=12),
+                                    row_names_gp = grid::gpar(fontsize = 8),
+                                    row_gap = grid::unit(0.5, "line"),
+                                    show_row_dend = TRUE,
+                                    show_column_dend = TRUE,
+                                    heatmap_legend_param = list(legend_direction = "horizontal")
+                                    )
+                )
+
+# pdf(paste0(figures,"/02/Heatmap_sens_antagonist.pdf"),height=10,width=16)
+# ComplexHeatmap::draw(h, heatmap_legend_side="top")
+# dev.off()
+
+svg(paste0(figures,"/02/Figure 7b - Improving screening using cluster tailored subset models.svg"),height=10,width=7)
+ComplexHeatmap::draw(h, heatmap_legend_side="top")
+dev.off()
+h
+rm(h)
+```
+
+```{r}
+ALL_vs_FULL_clust[clus_prediction %in% bad_antagonist_clusters & submodel.x %in% unique(BAD_ANTA_SOL$submodel.x),.(submodel.x,clus_prediction,sens.Antagonist.clust,spec.Antagonist.clust,assays,nchem_clus)]
+```
+
+```{r}
+# How many EDSP clusters have AR activity (agonist and antagonist)?
+# Sensitivity is undefined when there are no positives, so we have to check:
+# 1. sens.Agonist.clust and identify which ara NA which are not
+# 2. sens.Antagonist.clust and identify which ara NA which are not
+# 3. create a Venn diagram
+
+#ACT_clust = unique(ALL_vs_FULL_clust[,.(submodel.x,clus_prediction,sens.Agonist.clust,sens.Antagonist.clust)])
+ACT_clust = unique(ALL_vs_FULL_clust[,.(clus_prediction,sens.Agonist.clust,sens.Antagonist.clust)])
+
+ACT_clust[,`Agonist inactive clusters` := ifelse(is.na(sens.Agonist.clust),1,0)]
+ACT_clust[,`Agonist active clusters` := ifelse(is.na(sens.Agonist.clust),0,1)]
+
+ACT_clust[,`Antagonist inactive clusters` := ifelse(is.na(sens.Antagonist.clust),1,0)]
+ACT_clust[,`Antagonist active clusters` := ifelse(is.na(sens.Antagonist.clust),0,1)]
+
+ACT_INACT_clust = unique(ACT_clust[,.(clus_prediction,`Agonist inactive clusters`, `Agonist active clusters`,`Antagonist inactive clusters`, `Antagonist active clusters`)])
+
+c4 = cbind(ACT_INACT_clust$`Agonist inactive clusters`, 
+           ACT_INACT_clust$`Agonist active clusters`, 
+           ACT_INACT_clust$`Antagonist active clusters`,
+           ACT_INACT_clust$`Antagonist inactive clusters`
+           )
+```
+
+```{r}
+
+a = limma::vennCounts(c4)
+svg(file=paste0(figures,"/02/Figure 3 - Venn diagram active and inactive clusters.svg"))
+vennDiagram(a, include = "both", 
+                 names = c("Agonist \n inactive clusters",
+                           "Agonist \n active clusters",
+                           "Antagonist \n active clusters",
+                           "Antagonist \n inactive clusters"
+                          ), circle.col = c("red", "green","blue","orange"),
+                 cex = 1, counts.col = "red")
+dev.off()
+
+`Agonist inactive clusters` = ACT_INACT_clust[`Agonist inactive clusters`==1,(clus_prediction)]
+`Agonist active clusters` = ACT_INACT_clust[`Agonist active clusters`==1,(clus_prediction)]
+`Antagonist active clusters` = ACT_INACT_clust[`Antagonist active clusters`==1,(clus_prediction)]
+`Antagonist inactive clusters` = ACT_INACT_clust[`Antagonist inactive clusters`==1,(clus_prediction)]
+```
+
+```{r}
+createVennDiagramsMarkers <- function (){
+    require(VennDiagram)
+
+    x <- list()
+
+    x$`Agonist active clusters` <- `Agonist active clusters`
+    x$`Antagonist active clusters` <- `Antagonist active clusters`
+
+    v0 <<-venn.diagram(x, height=9000, width=9000,
+                      col = c("red", "blue"),
+                      fill = c("red", "blue"), 
+                      filename = NULL,
+                      #pos=-2,
+                      #cat.pos=-180,
+                      cat.dist=0.15,
+                      cex=0.67,scaled = FALSE
+                      )
+    
+
+    overlaps <- calculate.overlap(list("Agonist active clusters" = x$`Agonist active clusters`,"Antagonist active clusters" = x$`Antagonist active clusters`))
+#     print(overlaps$a1)
+#     print(overlaps$a2)
+#     print(overlaps$a3)
+    overlaps$a1 = setdiff(overlaps$a1,overlaps$a3)
+    overlaps$a2 = setdiff(overlaps$a2,overlaps$a3)
+    #overlaps <- rev(overlaps)
+    #print(overlaps)
+
+    posOverlap = as.numeric (gsub ("a","", (names (overlaps))))
+    for (i in 1:length(overlaps)){
+        #print(i)
+          pos = posOverlap[i]
+          #print(overlaps[[i]])
+
+          if(i==1 | i==3){
+              #print("AAAA")
+              lbl = paste(strwrap(paste(overlaps[[i]],collapse=" "),7),collapse="\n")
+              #print(lbl)
+              #v0[[pos+8]]$label <- lbl
+          } else {
+              #print("BBB")
+              lbl = paste(strwrap(paste(overlaps[[i]],collapse="   "),30),collapse="\n")
+              #v0[[pos+8]]$label <- lbl
+          }
+          v0[[pos+4]]$label <- lbl
+    }
+
+    svg(paste0(figures,"/02/Figure 2 - Venn diagram active cluster IDs.svg"),width = 9.5, height = 9.5)
+    grid.draw(v0)
+    dev.off()
+    
+#     pdf(paste0(figures,"/02/venn.pdf"),width = 9.5, height = 9.5)
+#     grid.draw(v0)
+#     dev.off()
+}
+createVennDiagramsMarkers ()
+```
+
+
+```{r}
+# print("Number of clusters with more that 1 chemical per cluster:")
+# cat(length(unique(ALL_vs_FULL_clust[nchem_clus>1,clus_prediction])),'clusters \n')
+# print("#####")
+# print("Sensitivity in antagonist mode is defined on:")
+# #cat(length(unique(ALL_vs_FULL_clust[prevalence.Antagonist.clust!=0,clus_prediction])),'clusters \n')
+# print("Sensitivity in antagonist mode is defined on, and more than 1 chemical per cluster:")
+# cat(length(unique(ALL_vs_FULL_clust[!is.na(sens.Antagonist.clust) & nchem_clus>1,clus_prediction])),'clusters \n')
+# print("Sensitivity in antagonist mode is NOT defined on:")
+# cat(length(unique(ALL_vs_FULL_clust[is.na(sens.Antagonist.clust),clus_prediction])),'clusters \n')
+# print("Specificity in antagonist mode is defined on:")
+# cat(length(unique(ALL_vs_FULL_clust[prevalence.Antagonist.clust!=1,clus_prediction])),'clusters \n')
+# print("Specificity in antagonist mode is defined on, and more than 1 chemical per cluster:")
+# cat(length(unique(ALL_vs_FULL_clust[prevalence.Antagonist.clust!=1 & nchem_clus>1,clus_prediction])),'clusters \n')
+
+```
+
+```{r}
+# Antagonist mode: Clusters where sensitivity and specificity are not defined
+#print("Why sensitivity is not defined ?")
+#unique(ALL_vs_FULL_clust[is.na(sens.Antagonist.clust),.(TP.Antagonist,FP.Antagonist,TN.Antagonist,FN.Antagonist)])
+# Sensitivity is TP/(TP + FN). In all clusters where Sensitivity is not defined, TPs and FNs are zero. That is why it is undefined.
+```
+
+```{r}
+#print("Why specificity is not defined ?")
+#unique(ALL_vs_FULL_clust[is.na(spec.Antagonist.clust),.(TP.Antagonist,FP.Antagonist,TN.Antagonist,FN.Antagonist)])
+# Specificity is TN/(TN + FP). In all clusters where Sensitivity is not defined, FPs and TNs are zero. That is why it is undefined in those clusters.
+```
+
+```{r}
+# What the full model predicts in clusters where sensitivity is not defined?
+#unique(ALL_vs_FULL_clust[is.na(sens.Antagonist.clust),AUC.Antagonist.y.bin])
+# This makes sense. No positives, that is why there are no TPs and FNs
+```
+
+```{r}
+# print("Sensitivity in agonist mode is defined on:")
+# cat(length(unique(ALL_vs_FULL_clust[prevalence.Agonist.clust!=0,clus_prediction])),'clusters \n')
+# print("Specificity in agonist mode is defined on:")
+# cat(length(unique(ALL_vs_FULL_clust[prevalence.Agonist.clust!=1,clus_prediction])),'clusters \n')
+```
+
+```{r}
+# # Agonist mode: Clusters where sensitivity and specificity are not defined
+# print("Why sensitivity is not defined ?")
+# unique(ALL_vs_FULL_clust[is.na(sens.Agonist.clust),.(TP.Agonist,FP.Agonist,TN.Agonist,FN.Agonist)]) # similar arguments as above
+# print("Why specificity is not defined ?")
+# unique(ALL_vs_FULL_clust[is.na(spec.Agonist.clust),.(TP.Agonist,FP.Agonist,TN.Agonist,FN.Agonist)]) # similar arguments as above
+```
+
+```{r}
+# What the full model predicts in clusters where sensitivity is not defined?
+#unique(ALL_vs_FULL_clust[is.na(sens.Agonist.clust),AUC.Agonist.y.bin])
+# This makes sense. No positives, that is why there are no TPs and FNs
+```
+
+```{r}
+# The Matthews correlation coefficient (MCC)
+# (TP*TN-FP*FN)/sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+# Calculate MCC
+    # numerator <- (TP * TN - FP * FN)
+    # denominator <- sqrt((TP + FP)*(TP + FN)*(TN + FP)*(TN + FN))
+    # if(denominator == 0) denominator <- 1
+    # result <- numerator/denominator
+# This is  mltools approach. It sets denominator to 1 if it is 0.
+# This is mathematically justified in the paper: "The advantages of the Matthews correlation coefficient (MCC) over F1 score and accuracy in binary classification evaluation". I will use it!
+
+# ALL_vs_FULL_clust[,'mcc.Agonist.clust' := ifelse(sqrt((sum(TP.Agonist)+sum(FP.Agonist))*(sum(TP.Agonist)+sum(FN.Agonist))*(sum(TN.Agonist)+sum(FP.Agonist))*(sum(TN.Agonist)+sum(FN.Agonist)))==0,(sum(TP.Agonist)*sum(TN.Agonist)-sum(FP.Agonist)*sum(FN.Agonist))/1,(sum(TP.Agonist)*sum(TN.Agonist)-sum(FP.Agonist)*sum(FN.Agonist))/sqrt((sum(TP.Agonist)+sum(FP.Agonist))*(sum(TP.Agonist)+sum(FN.Agonist))*(sum(TN.Agonist)+sum(FP.Agonist))*(sum(TN.Agonist)+sum(FN.Agonist)))),by=.(submodel.x,clus_prediction)]
+```
+
+```{r}
+# ALL_vs_FULL_clust[,'mcc.Antagonist.clust' :=ifelse(sqrt((sum(TP.Antagonist)+sum(FP.Antagonist))*(sum(TP.Antagonist)+sum(FN.Antagonist))*(sum(TN.Antagonist)+sum(FP.Antagonist))*(sum(TN.Antagonist)+sum(FN.Antagonist)))==0,(sum(TP.Antagonist)*sum(TN.Antagonist)-sum(FP.Antagonist)*sum(FN.Antagonist))/1,(sum(TP.Antagonist)*sum(TN.Antagonist)-sum(FP.Antagonist)*sum(FN.Antagonist))/sqrt((sum(TP.Antagonist)+sum(FP.Antagonist))*(sum(TP.Antagonist)+sum(FN.Antagonist))*(sum(TN.Antagonist)+sum(FP.Antagonist))*(sum(TN.Antagonist)+sum(FN.Antagonist)))),by=.(submodel.x,clus_prediction)]
+```
+
+```{r}
+# Calculate False Discovery Rate
+# FDR = FP/(FP+TP)
+#ALL_vs_FULL_clust[,'fdr.Agonist.clust' :=sum(FP.Agonist)/(sum(TP.Agonist)+sum(FP.Agonist)),by=.(submodel.x,clus_prediction)]
+#ALL_vs_FULL_clust[,'fdr.Antagonist.clust' :=sum(FP.Antagonist)/(sum(TP.Antagonist)+sum(FP.Antagonist)),by=.(submodel.x,clus_prediction)]
+```
+
+```{r}
+#ALL_vs_FULL_clust[is.na(clus_prediction)] # check
+```
+
+```{r}
+# Calculate mean(subset AUC – full model AUC) for each cluster and each subset model (rows)
+# ALL_vs_FULL_clust[,mean_difference_subset_vs_full.Agonist:=mean(AUC.Agonist.x-AUC.Agonist.y),by=.(submodel.x,clus_prediction)]
+# ALL_vs_FULL_clust[,mean_difference_subset_vs_full.Antagonist:=mean(AUC.Antagonist.x-AUC.Antagonist.y),by=.(submodel.x,clus_prediction)]
+```
+
+```{r}
+# 4.2 Antagonist sensitivity analysis
+
+# Let's get hit-call matrix for all clusters where sensitivity is not defined in antagonist mode
+
+# Access the database.
+# Due to the current setup, we use an accommodated "tcpl" library.
+## Read database configuration from yaml file
+if (configr::is.yaml.file(here::here("dbconfig.yml"))){
+  dbconfig <- configr::read.config(file = here::here("dbconfig.yml"))
+}else{
+  stop("Unable to read database configuration.")
+}
+
+
+# Configure the connection to the database.
+tcplConf(drvr = "MySQL",
+         user = dbconfig[['user']],
+         pass = dbconfig[['password']],
+         host = dbconfig[['host']],
+         db = dbconfig[['database']],
+         port = dbconfig[['dbport']])
+
+```
+
+```{r}
+# Get data from ToxCast.
+TC_out = tcplVarMat(chid = NULL, aeid = NULL, row.id = "code", flag = TRUE, cyto.pars = list(), include.na.chid = FALSE, odir = NULL, file.prefix = NULL)
+```
+
+```{r}
+# Extract hit-call matrix - Explaiantions will be made using the hit-call matrix, as it corresponds to the AUC calculation.
+# Cytotox is not needed as it doesn't play a role in AUCs
+hitc = as.data.table(data.frame(code = as.character(row.names(TC_out$hitc)), TC_out$hitc))
+hitc[,code:=as.character((code))]
+write.csv(hitc,paste0(output,"/02/hitc.csv"),row.names = FALSE)
+```
+
+```{r}
+# Select only assays and chemicals of interest.
+hitc_AR = fread(paste0(output,"/02/hitc.csv"))
+```
+
+```{r}
+TBL1 = c("NVS_NR_hAR", # no viability assay
+         "NVS_NR_cAR", # no viability assay
+         "NVS_NR_rAR", # no viability assay
+         "OT_AR_ARSRC1_0480", # no viability assay
+         "OT_AR_ARSRC1_0960", # no viability assay
+         "UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Agonist", # no viability assay
+         "ATG_AR_TRANS_up", # no viability assay
+         "OT_AR_ARELUC_AG_1440", # no viability assay
+         "TOX21_AR_BLA_Agonist_ratio", # no viability assay
+         "TOX21_AR_LUC_MDAKB2_Agonist", # no viability assay. TOX21_AR_LUC_MDAKB2_Agonist_3uM_Nilutamide_viability?
+         "ACEA_AR_agonist_80hr", # no viability assay. ACEA_AR_agonist_AUC_viability?
+         "UPITT_HCI_U2OS_AR_TIF2_Nucleoli_Antagonist", # no viability assay
+         "TOX21_AR_BLA_Antagonist_ratio", # 1. TOX21_AR_BLA_Antagonist_viability
+         "TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881"# 2. TOX21_AR_LUC_MDAKB2_Antagonist_0.5nM_R1881_viability
+         )
+code_TBL1 = c('code',TBL1)
+code_TBL1
+```
+
+```{r}
+# Change CAS for "51630-58-1" to new CAS “67614-33-9”.
+
+CHMS[code == 'C51630581',c('code','casrn'):=.('C67614339','67614-33-9')]
+```
+
+```{r}
+hitc_AR = hitc_AR[code %in% unique(CHMS$code),..code_TBL1]
+hitc_AR[is.na(hitc_AR)] = 0 # NA values are related to NVS assays which were tested in single concentration and didn't show activity. I will set them to 0.
+hitc_AR
+```
+
+```{r}
+hitc_AR[,colnames(hitc_AR)[-1] := lapply(.SD, as.integer),.SDcols = TBL1]
+hitc_AR
+```
+
+```{r}
+write.csv(hitc_AR,paste0(output,"/02/hitc_AR.csv"),row.names = FALSE)
+```
+
+```{r}
+# Chemicals in the AR model present in v3.2 version but not present in v3.3 due to CASRN change
+unique(CHMS$code)[!unique(CHMS$code) %in% unique(hitc_AR$code)]
+```
+
+```{r}
+tail(hitc_AR$code)
+```
+
+```{r}
+tc$CASRN[grepl('NOCAS',tc$CASRN)]
+```
+
+```{r}
+# Add "code" column in tc, so that I can merge hitc_AR and tc
+tc[,code:=ifelse(grepl("NOCAS",CASRN),paste0("C",stringr::str_replace_all(CASRN,"_","")),paste0("C",stringr::str_replace_all(CASRN,"-","")))]
+```
+
+```{r}
+tc$code[grepl('NOCAS',tc$code)]
+```
+
+```{r}
+tc[code=='C51630581',c('code','CASRN'):=.('C67614339','67614-33-9')]
+```
+
+```{r}
+tc[code=='C67614339',]
+```
+
+```{r}
+# Merge hitc and tc
+AR_hitc = merge(hitc_AR,tc[,.(code,clus_prediction,PREFERRED_NAME,CASRN,DTXSID)],by='code')
+
+# Seems all good
+dim(AR_hitc)
+AR_hitc$code[grepl('NOCAS',AR_hitc$code)]
+AR_hitc
+```
+
+```{r}
+# 4.3 - Differences between the 14-assay AR model (AR_14), and the 11-assay AR model (AR_11)
+
+AR_KM = merge(AR_14_11,tc,by.x = "CODE",by.y = "code",all.x = TRUE)[,.(CODE,CASRN.x,AUC.Agonist.x,AUC.Antagonist.x,AUC.Agonist.bin.x,AUC.Antagonist.bin.x,
+                                                                       AUC.Agonist.y,AUC.Antagonist.y,AUC.Agonist.bin.y,AUC.Antagonist.bin.y,
+                                                                       `Antagonist: AR_14 = Pos & AR_11 = Pos`, `Antagonist: AR_14 = Pos & AR_11 = Neg`,
+                                                                       `Antagonist: AR_14 = Neg & AR_11 = Neg`, `Antagonist: AR_14 = Neg & AR_11 = Pos`,
+                                                                       `Agonist: AR_14 = Pos & AR_11 = Pos`, `Agonist: AR_14 = Pos & AR_11 = Neg`, 
+                                                                       `Agonist: AR_14 = Neg & AR_11 = Neg`,
+                                                                       `Agonist: AR_14 = Neg & AR_11 = Pos`,
+                                                                       DTXSID,PREFERRED_NAME,DTXCID,CASRN,SMILES,QSAR_READY_SMILES,clus_prediction,clus_prob,in_edsp_universe,in_judson_ER_2015)]
+```
+
+```{r}
+write.csv(AR_KM,paste0(output,'/02/AR_14_vs_AR_11.csv'))
+```
+
+```{r}
+AR_KM
+```
+
+```{r}
+AR_KM_venn = AR_KM[,.(CODE,CASRN.x,`Antagonist: AR_14 = Pos & AR_11 = Neg`, `Antagonist: AR_14 = Neg & AR_11 = Pos`, `Agonist: AR_14 = Pos & AR_11 = Neg`,`Agonist: AR_14 = Neg & AR_11 = Pos`,clus_prediction)]
+```
+
+```{r}
+
+```
+
+```{r}
+AR_KM_venn[!(is.na(`Antagonist: AR_14 = Pos & AR_11 = Neg`) & is.na(`Antagonist: AR_14 = Neg & AR_11 = Pos`) &
+               is.na(`Agonist: AR_14 = Pos & AR_11 = Neg` & is.na(`Agonist: AR_14 = Neg & AR_11 = Pos`)))]
+```
+
+```{r}
+Antagonist_AR_14_Active_AR_11_Inactive <- (AR_KM_venn$`Antagonist: AR_14 = Pos & AR_11 = Neg` > 0)
+Antagonist_AR_14_Active_AR_11_Inactive[is.na(Antagonist_AR_14_Active_AR_11_Inactive)] = 0
+
+Antagonist_AR_14_Inactive_AR_11_Active <- (AR_KM_venn$`Antagonist: AR_14 = Neg & AR_11 = Pos` > 0)
+Antagonist_AR_14_Inactive_AR_11_Active[is.na(Antagonist_AR_14_Inactive_AR_11_Active)] = 0
+
+Agonist_AR_14_Active_AR_11_Inactive <- (AR_KM_venn$`Agonist: AR_14 = Pos & AR_11 = Neg` > 0)
+Agonist_AR_14_Active_AR_11_Inactive[is.na(Agonist_AR_14_Active_AR_11_Inactive)] = 0
+
+Agonist_AR_14_Inactive_AR_11_Active <- (AR_KM_venn$`Agonist: AR_14 = Neg & AR_11 = Pos` > 0)
+Agonist_AR_14_Inactive_AR_11_Active[is.na(Agonist_AR_14_Inactive_AR_11_Active)] = 0
+
+c4 = cbind(Antagonist_AR_14_Active_AR_11_Inactive, Antagonist_AR_14_Inactive_AR_11_Active, Agonist_AR_14_Active_AR_11_Inactive,Agonist_AR_14_Inactive_AR_11_Active)
+a = vennCounts(c4)
+vennDiagram(a, include = "both", 
+  names = c("Antagonist \n AR_14:Active & \n AR_11:Inactive", 
+            "Antagonist \n AR_14:Inactive & \n AR_11:Active", 
+            "Agonist \n AR_14:Active & \n AR_11:Inactive", 
+            "Agonist \n AR_14:Inactive & \n AR_11:Active"), circle.col = c("red", "green","blue","orange"),
+  cex = 1, counts.col = "red")
+```
+
+```{r}
+# Explain differences between models
+```
+
+```{r}
+AR_KM_venn = AR_KM[,.(CODE,CASRN.x,`Antagonist: AR_14 = Pos & AR_11 = Neg`, `Antagonist: AR_14 = Neg & AR_11 = Pos`, `Agonist: AR_14 = Pos & AR_11 = Neg`,`Agonist: AR_14 = Neg & AR_11 = Pos`,clus_prediction)]
+AR_KM_venn
+```
+
+```{r}
+Antag_AR_14_Pos_AR_11_Neg = AR_KM_venn[!is.na(`Antagonist: AR_14 = Pos & AR_11 = Neg`),CODE]
+Antag_AR_14_Pos_AR_11_Neg
+```
+
+```{r}
+Antag_AR_14_Neg_AR_11_Pos = AR_KM_venn[!is.na(`Antagonist: AR_14 = Neg & AR_11 = Pos`),CODE]
+Antag_AR_14_Neg_AR_11_Pos
+```
+
+```{r}
+Agon_AR_14_Pos_AR_11_Neg = AR_KM_venn[!is.na(`Agonist: AR_14 = Pos & AR_11 = Neg`),CODE]
+Agon_AR_14_Pos_AR_11_Neg
+```
+
+```{r}
+Agon_AR_14_Neg_AR_11_Pos = AR_KM_venn[!is.na(`Agonist: AR_14 = Neg & AR_11 = Pos`),CODE]
+Agon_AR_14_Neg_AR_11_Pos
+```
+
+```{r}
+KM1 = merge(hitc_AR[code %in% Antag_AR_14_Pos_AR_11_Neg,],tc[,.(code,clus_prediction)],all.x = TRUE, by = "code")
+KM2 = merge(hitc_AR[code %in% Antag_AR_14_Neg_AR_11_Pos,],tc[,.(code,clus_prediction)],all.x = TRUE, by = "code")
+KM3 = merge(hitc_AR[code %in% Agon_AR_14_Pos_AR_11_Neg,],tc[,.(code,clus_prediction)],all.x = TRUE, by = "code")
+KM4 = merge(hitc_AR[code %in% Agon_AR_14_Neg_AR_11_Pos,],tc[,.(code,clus_prediction)],all.x = TRUE, by = "code")
+```
+
+```{r}
+write.csv(KM1,paste0(output,'/02/hitc_AR_Antag_AR_14_Pos_AR_11_Neg.csv')) # Supplemental material
+```
+
+```{r}
+write.csv(KM2,paste0(output,'/02/hitc_AR_Antag_AR_14_Neg_AR_11_Pos.csv')) # Supplemental material
+```
+
+```{r}
+write.csv(KM3,paste0(output,'/02/hitc_AR_Agon_AR_14_Pos_AR_11_Neg.csv')) # Supplemental material
+```
+
+```{r}
+write.csv(KM4,paste0(output,'/02/hitc_AR_Agon_AR_14_Neg_AR_11_Pos.csv')) # Supplemental material
+```
+
+```{r}
+# Only values for the full 14-assay AR model
+FULL = ALL_vs_FULL_clust[submodel.x==submodel.y]
+
+# Find chemicals that produce agonist only effec, antagonis only effect, and both effects.
+FULL[,agon_only:=ifelse(AUC.Antagonist.y.bin==0 & AUC.Agonist.y.bin==1,1,0)]
+FULL[,anta_only:=ifelse(AUC.Antagonist.y.bin==1 & AUC.Agonist.y.bin==0,1,0)]
+FULL[,both_effc:=ifelse(AUC.Antagonist.y.bin==1 & AUC.Agonist.y.bin==1,1,0)]
+
+# Clusters with AR agonist chemicals
+agon_clst_judson = unique(FULL[agon_only==1 | both_effc==1,clus_prediction])
+print(agon_clst_judson)
+cat('The number of chemicals in the AR agonist clusters:\n',length(unique(FULL[clus_prediction %in% agon_clst_judson,code])))
+
+# Find the number of: agonist only chemicals, antagonist only chemicals, and the number of chemicals with both effects
+FULL[,n_agon_only:=sum(agon_only),by=clus_prediction]
+FULL[,n_anta_only:=sum(anta_only),by=clus_prediction]
+FULL[,n_both_effc:=sum(both_effc),by=clus_prediction]
+
+# Calculate percentages
+FULL[,pct_agon_only:=100*sum(agon_only)/.N,by=clus_prediction]
+FULL[,pct_anta_only:=100*sum(anta_only)/.N,by=clus_prediction]
+FULL[,pct_both_effc:=100*sum(both_effc)/.N,by=clus_prediction]
+
+# Fractions
+FULL[,frct_agon_only:=paste(sum(agon_only),"/",.N),by=clus_prediction]
+FULL[,frct_anta_only:=paste(sum(anta_only),"/",.N),by=clus_prediction]
+FULL[,frct_both_effc:=paste(sum(both_effc),"/",.N),by=clus_prediction]
+
+# The number of chemicals with antagonists only effect
+FULL[AUC.Antagonist.y.bin==0 & AUC.Agonist.y.bin==1,.N]
+AGON_ONLY = FULL[AUC.Antagonist.y.bin==0 & AUC.Agonist.y.bin==1,.(clus_prediction,CASRN,code,name,nchem_clus,n_agon_only,pct_agon_only,frct_agon_only)]
+ANTA_ONLY = FULL[AUC.Antagonist.y.bin==1 & AUC.Agonist.y.bin==0,.(clus_prediction,CASRN,code,name,nchem_clus,n_anta_only,pct_anta_only,frct_anta_only)]
+BOTH_EFFC = FULL[AUC.Antagonist.y.bin==1 & AUC.Agonist.y.bin==1,.(clus_prediction,CASRN,code,name,nchem_clus,n_both_effc,pct_both_effc,frct_both_effc)]
+
+setnames(AGON_ONLY,
+         old=c('n_agon_only','pct_agon_only','frct_agon_only'),
+         new=c('n_effect','pct','frct'))
+
+setnames(ANTA_ONLY,
+         old=c('n_anta_only','pct_anta_only','frct_anta_only'),
+         new=c('n_effect','pct','frct'))
+
+setnames(BOTH_EFFC,
+         old=c('n_both_effc','pct_both_effc','frct_both_effc'),
+         new=c('n_effect','pct','frct'))
+
+AGON_ONLY[,Effect:='Agonist AR effect']
+ANTA_ONLY[,Effect:='Antagonist AR effect']
+BOTH_EFFC[,Effect:='Both AR effects']
+ANTA_ONLY[clus_prediction %in% c(113, 439, 534, 621, 789)]
+AGON_ONLY[clus_prediction %in% c(113, 439, 534, 621, 789)]
+BOTH_EFFC[clus_prediction %in% c(113, 439, 534, 621, 789)]
+```
+
+```{r}
+p = ggplot(data=BOTH_EFFC[order(pct),.(clus_prediction,pct,frct)], aes(x=clus_prediction, y=pct)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+ 
+  #ggtitle("Percentage of chemicals with both antagonist and agonists AR effects\n in associated clusters (Judson et al. 2020)") +
+  xlab("Cluster ID") + ylab("Percentage of chemicals with both antagonist and agonists AR effects")+
+  geom_text(aes(label=frct), vjust=1.5, color="white", size=3.5)+ ylim(0,100)+
+  theme_minimal()
+ggsave(paste0(figures,"/02/Both AR effects in Judson et al 2020.svg"), plot=p, width=2.7, height=9)
+p
+
+p = ggplot(data=AGON_ONLY[order(pct),.(clus_prediction,pct,frct)], aes(x=clus_prediction, y=pct)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+ 
+  ggtitle("Percentage of agonists in associated clusters (Judson et al. 2020)") +
+  xlab("Cluster ID") + ylab("Percentage of chemicals with AR agonist effect")+
+  geom_text(aes(label=frct), vjust=1.5, color="white", size=3.5)+
+  theme_minimal()
+ggsave(paste0(figures,"/02/Agonists ONLY in Judson et al 2020.svg"), plot=p, width=9, height=9)
+p
+
+AR_active = rbindlist(
+    list(
+        AGON_ONLY[,.(clus_prediction,CASRN,code,name,Effect)],
+        ANTA_ONLY[,.(clus_prediction,CASRN,code,name,Effect)],
+        BOTH_EFFC[,.(clus_prediction,CASRN,code,name,Effect)]
+    )  
+)
+length(unique(AR_active[,clus_prediction]))
+length(unique(AR_active[Effect=='Antagonist AR effect',clus_prediction]))
+length(unique(AR_active[Effect=='Agonist AR effect',clus_prediction]))
+length(unique(AR_active[Effect=='Both AR effects',clus_prediction]))
+unique(ALL_vs_FULL_clust[clus_prediction==493,code])
+```
+
+```{r}
+unique(ALL_vs_FULL_clust[clus_prediction==789 & submodel.x=="A11111111111111",.(code,AUC.Agonist.x.bin, AUC.Antagonist.x.bin)])
+```
+
+```{r}
+BOTH = unique(ALL_vs_FULL_clust[submodel.x=="A11111111111111" & AUC.Agonist.x.bin == 1 & AUC.Antagonist.x.bin==1,.(code,clus_prediction,nchem_clus,AUC.Agonist.x.bin, AUC.Antagonist.x.bin)])
+BOTH = unique(BOTH[,c('n_chem','effect'):=.(.N,"Both"),by=clus_prediction][,.(clus_prediction,nchem_clus,AUC.Agonist.x.bin,AUC.Antagonist.x.bin,n_chem,effect)])
+BOTH
+```
+
+```{r}
+ANTAGONISTS_ONLY = unique(ALL_vs_FULL_clust[submodel.x=="A11111111111111" & AUC.Agonist.x.bin == 0 & AUC.Antagonist.x.bin==1,.(code,clus_prediction,nchem_clus,AUC.Agonist.x.bin, AUC.Antagonist.x.bin)])
+ANTAGONISTS_ONLY = unique(ANTAGONISTS_ONLY[,c('n_chem','effect'):=.(.N,"Antagonists only"),by=clus_prediction][,.(clus_prediction,nchem_clus,AUC.Agonist.x.bin,AUC.Antagonist.x.bin,n_chem,effect)])
+ANTAGONISTS_ONLY
+```
+
+```{r}
+AGONISTS_ONLY = unique(ALL_vs_FULL_clust[submodel.x=="A11111111111111" & AUC.Agonist.x.bin == 1 & AUC.Antagonist.x.bin==0,.(code,clus_prediction,nchem_clus,AUC.Agonist.x.bin, AUC.Antagonist.x.bin)])
+AGONISTS_ONLY = unique(AGONISTS_ONLY[,c('n_chem','effect'):=.(.N,"Agonists only"),by=clus_prediction][,.(clus_prediction,nchem_clus,AUC.Agonist.x.bin,AUC.Antagonist.x.bin,n_chem,effect)])
+AGONISTS_ONLY
+```
+
+
+```{r}
+ANTA_BOTH = rbindlist(list(ANTAGONISTS_ONLY,BOTH))
+AGON_BOTH = rbindlist(list(AGONISTS_ONLY,BOTH))
+```
+
+```{r}
+ANTA_BOTH_AGON = unique(rbindlist(list(AGON_BOTH,ANTA_BOTH)))
+```
+
+```{r}
+ANTA_BOTH_AGON[,"inactive":=nchem_clus-sum(n_chem),by=clus_prediction]
+#AGON_BOTH[,"inactive":=nchem_clus-sum(n_chem),by=clus_prediction]
+```
+
+```{r}
+ANTA_BOTH_AGON_melt = melt(ANTA_BOTH_AGON,id.vars = c('clus_prediction','effect'),measure.vars = c('n_chem','inactive'))
+#AGON_BOTH_melt = melt(AGON_BOTH,id.vars = c('clus_prediction','effect'),measure.vars = c('n_chem','inactive'))
+```
+
+```{r}
+ANTA_BOTH_AGON_melt[variable!="inactive","variable":=effect]
+#AGON_BOTH_melt[variable!="inactive","variable":=effect]
+```
+
+```{r}
+ANTA_BOTH_AGON_melt = unique(ANTA_BOTH_AGON_melt[,.(clus_prediction,variable,value)])
+#AGON_BOTH_melt = unique(AGON_BOTH_melt[,.(clus_prediction,variable,value)])
+```
+
+```{r}
+antagonist_clusters = unique(ALL_vs_FULL_clust[submodel.x=="A11111111111111" & AUC.Antagonist.x.bin==1,clus_prediction])
+```
+
+```{r}
+agonist_clusters = unique(ALL_vs_FULL_clust[submodel.x=="A11111111111111" & AUC.Agonist.x.bin==1,clus_prediction])
+```
+
+```{r}
+p = ggplot(ANTA_BOTH_AGON_melt[clus_prediction %in% antagonist_clusters], aes(x = clus_prediction, y = value, fill = variable, label = value)) +
+  geom_bar(stat = "identity") +
+  geom_text(size = 3, position = position_stack(vjust = 0.5))+ 
+  xlab("Cluster ID") +
+  ylab("Number of Chemcials") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave(paste0(figures,"/02/Distribution in antagonist clusters.svg"), plot=p, width=15, height=4)
+p
+```
+
+```{r}
+p = ggplot(ANTA_BOTH_AGON_melt[clus_prediction %in% agonist_clusters], aes(x = clus_prediction, y = value, fill = variable, label = value)) +
+  geom_bar(stat = "identity") +
+  geom_text(size = 3, position = position_stack(vjust = 0.5))+
+  xlab("Cluster ID") +
+  ylab("Number of Chemcials") 
+ggsave(paste0(figures,"/02/Distribution in agonist clusters.svg"), plot=p, width=8, height=4)
+p
+```
+
+```{r}
+T4 = ALL_vs_FULL_clust[submodel.x=="A11111111111111",.(clus_prediction,AUC.Agonist.x.bin,AUC.Antagonist.x.bin,DTXSID)]
+write.csv(T4,paste0(output,'/02/A11111111111111 and clusters.csv'))
+```
+
+```{r}
+# Clusters where we see chemicals predicted to have both AR agonist and antagonist activity
+A14_both = unique(T4[AUC.Agonist.x.bin ==1 & AUC.Antagonist.x.bin==1,clus_prediction])
+A14_both
+```
+
+```{r}
+# Clusters with both agonist and antagonist activity
+A14_agonist_antagonist = intersect(antagonist_clusters,agonist_clusters)
+A14_agonist_antagonist
+length(unique(T4[clus_prediction %in% A14_agonist_antagonist & (AUC.Agonist.x.bin==1 | AUC.Antagonist.x.bin==1),DTXSID]))
+length(unique(T4[clus_prediction %in% A14_agonist_antagonist,DTXSID]))
+```
+
+```{r}
+# Clusters with only agonist activity
+agonist_clusters_only = agonist_clusters[!(agonist_clusters %in% A14_agonist_antagonist)]
+length(agonist_clusters_only)
+length(unique(T4[clus_prediction %in% agonist_clusters_only & (AUC.Agonist.x.bin==1),DTXSID]))
+length(unique(T4[clus_prediction %in% agonist_clusters_only,DTXSID]))
+```
+
+```{r}
+# Clusters with only agonist activity
+antagonist_clusters_only = antagonist_clusters[!(antagonist_clusters %in% A14_agonist_antagonist)]
+length(antagonist_clusters_only)
+length(unique(T4[clus_prediction %in% antagonist_clusters_only & (AUC.Antagonist.x.bin==1),DTXSID]))
+length(unique(T4[clus_prediction %in% antagonist_clusters_only,DTXSID]))
+```
+
+```{r}
+# Inactives
+unique(T4[!(clus_prediction %in% antagonist_clusters) & !(clus_prediction %in% agonist_clusters),.(AUC.Agonist.x.bin,AUC.Antagonist.x.bin)])
+inactive_only = unique(T4[!(clus_prediction %in% antagonist_clusters) & !(clus_prediction %in% agonist_clusters),clus_prediction])
+length(inactive_only)
+length(unique(T4[clus_prediction %in% inactive_only,DTXSID]))
+```
+
+```{r}
+CoMPARA = fread(paste0(input,'EDSP_DTXSID-txt_OPERA2.7Pred_CoMPARA.csv'))
+
+length(unique(CoMPARA$MoleculeID))
+
+CoMPARA[is.na(CoMPARA_Ago_pred)]
+
+nrow(CoMPARA[is.na(CoMPARA_Ago_pred)])
+nrow(CoMPARA[is.na(CoMPARA_Anta_pred)])
+nrow(CoMPARA[is.na(CoMPARA_Ago_pred) | is.na(CoMPARA_Anta_pred)])
+nrow(CoMPARA[is.na(CoMPARA_Ago_pred) | !is.na(CoMPARA_Anta_pred)])
+
+head(CoMPARA)
+
+library(tidyverse)
+
+volatility <- readr::read_tsv(paste0(input,"/volatility_bins_for_edsp_substances_no_mixtures.tsv"))
+
+chem_info <- volatility %>% filter(volatility %in% c("Slight", "None")) %>% inner_join(CoMPARA, by = c("DTXSID" = "MoleculeID"))
+
+screening_chems <- chem_info %>% 
+  select(DTXSID, PREFERRED_NAME, CASRN, cluster_id, CoMPARA_Ago_pred, CoMPARA_Anta_pred)
+
+screening_chems
+
+nrow(screening_chems) 
+```
+
+```{r}
+screening_chems_DT = as.data.table(screening_chems)
+screening_chems_DT
+```
+
+```{r}
+screening_chems_DT[DTXSID %in% c("DTXSID2044688","DTXSID00893611","DTXSID0038887","DTXSID9025328")]
+```
+
+```{r}
+# Remove chemicals for which bothe AR agonism and antagonism were predicted as NaN
+SC = screening_chems_DT[!(is.na(CoMPARA_Ago_pred) & is.na(CoMPARA_Anta_pred))]
+```
+
+```{r}
+SC[DTXSID %in% c("DTXSID2044688","DTXSID00893611","DTXSID0038887","DTXSID9025328")]
+```
+
+```{r}
+# number of chemicals from CoMPARA to consider
+nrow(SC)
+write.csv(SC,paste0(output,'/02/Compara predictions.csv'))
+```
+
+```{r}
+unique(SC[,CoMPARA_Ago_pred])
+```
+
+```{r}
+unique(SC[,CoMPARA_Anta_pred])
+```
+
+```{r}
+compara_antagonist_clusters = unique(SC[CoMPARA_Anta_pred==1,cluster_id])
+compara_antagonist_clusters
+
+compara_agonist_clusters = unique(SC[CoMPARA_Ago_pred==1,cluster_id])
+compara_agonist_clusters
+```
+
+```{r}
+# Clusters with both agonist and antagonist activity
+C_agonist_antagonist = intersect(compara_antagonist_clusters,compara_agonist_clusters)
+C_agonist_antagonist
+length(C_agonist_antagonist)
+length(unique(SC[cluster_id %in% C_agonist_antagonist & (CoMPARA_Ago_pred==1 | CoMPARA_Anta_pred==1),DTXSID]))
+length(unique(SC[cluster_id %in% C_agonist_antagonist,DTXSID]))
+```
+
+```{r}
+# Clusters with only agonist activity
+C_agonist_clusters_only = compara_agonist_clusters[!(compara_agonist_clusters %in% C_agonist_antagonist)]
+length(C_agonist_clusters_only)
+length(unique(SC[cluster_id %in% C_agonist_clusters_only & (CoMPARA_Ago_pred==1),DTXSID]))
+length(unique(SC[cluster_id %in% C_agonist_clusters_only,DTXSID]))
+```
+
+```{r}
+# Clusters with only antagonist activity
+C_antagonist_clusters_only = compara_antagonist_clusters[!(compara_antagonist_clusters %in% C_agonist_antagonist)]
+length(C_antagonist_clusters_only)
+length(unique(SC[cluster_id %in% C_antagonist_clusters_only & (CoMPARA_Anta_pred==1),DTXSID]))
+length(unique(SC[cluster_id %in% C_antagonist_clusters_only,DTXSID]))
+```
+
+```{r}
+# Inactives
+unique(SC[!(cluster_id %in% compara_antagonist_clusters) & !(cluster_id %in% compara_agonist_clusters),.(CoMPARA_Ago_pred,CoMPARA_Anta_pred)])
+c_inactive_only = unique(SC[!(cluster_id %in% compara_antagonist_clusters) & !(cluster_id %in% compara_agonist_clusters),cluster_id])
+length(c_inactive_only)
+length(unique(SC[cluster_id %in% c_inactive_only,DTXSID]))
+```
+
+
+```{r}
+unique(T4$DTXSID[!(T4$DTXSID %in% SC$DTXSID)])
+```
+
+```{r}
+CoMPARA_AR14 = merge(SC,T4,by.x = "DTXSID", by.y = "DTXSID",all=TRUE)
+```
+
+```{r}
+write.csv(CoMPARA_AR14,paste0(output,'/02/CoMPARA and AR14 predictions.csv'))
+```
+
+```{r}
+
+
+```
+
+```{r}
+CoMPARA = fread(paste0(input,'/EDSP_DTXSID-txt_OPERA2.7Pred_CoMPARA.csv'))
+
+length(unique(CoMPARA$MoleculeID))
+
+CoMPARA[is.na(CoMPARA_Ago_pred)]
+
+nrow(CoMPARA[is.na(CoMPARA_Ago_pred)])
+nrow(CoMPARA[is.na(CoMPARA_Anta_pred)])
+nrow(CoMPARA[is.na(CoMPARA_Ago_pred) | is.na(CoMPARA_Anta_pred)])
+nrow(CoMPARA[is.na(CoMPARA_Ago_pred) | !is.na(CoMPARA_Anta_pred)])
+
+head(CoMPARA)
+
+library(tidyverse)
+
+volatility <- readr::read_tsv(paste0(input,"/volatility_bins_for_edsp_substances_no_mixtures.tsv"))
+
+chem_info <- volatility %>% filter(volatility %in% c("Slight", "None")) %>% inner_join(CoMPARA, by = c("DTXSID" = "MoleculeID"))
+
+screening_chems <- chem_info %>% 
+  select(DTXSID, PREFERRED_NAME, CASRN, cluster_id, CoMPARA_Ago_pred, CoMPARA_Anta_pred)
+
+screening_chems
+
+nrow(screening_chems) 
+
+# Judsnon's 2020 CAS not in EDSP
+length(unique(ALL_vs_FULL_clust$CASRN)[!(unique(ALL_vs_FULL_clust$CASRN) %in% unique(screening_chems$CASRN))])
+
+screening_chems_DT = setDT(screening_chems)
+
+screening_chems_DT[is.na(CoMPARA_Ago_pred)]
+
+screening_chems_DT[is.na(CoMPARA_Anta_pred)]
+
+# Remove DTXSID2044688 and DTXSID00893611
+screening_chems_DT = screening_chems_DT[!is.na(CoMPARA_Anta_pred)]
+
+screening_chems_DT[is.na(CoMPARA_Anta_pred)]
+cat('The number of chemicals with AR predictions in CoMPARA:\n',nrow(screening_chems_DT))
+
+# The number of AR active chemiclas predicted by CoMPARA
+cat('The number of AR active chemicals predicted by CoMPARA:\n',nrow(screening_chems_DT[CoMPARA_Ago_pred==1 | CoMPARA_Anta_pred==1]))
+
+# The number of AR agonsits predicted by CoMPARA
+cat('The number of AR agonsits predicted by CoMPARA (some chemicals can be predicted as AR agonist and antagonist at the same time):\n',nrow(screening_chems_DT[CoMPARA_Ago_pred==1]))
+
+# The number of AR agonists-only
+cat('The number of AR agonists-only:\n',nrow(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==0]))
+
+# The number of AR antagonists (some may be AR agonists as well)
+cat('The number of AR antagonists (some may be AR agonists as well):\n',nrow(screening_chems_DT[CoMPARA_Anta_pred==1]))
+
+# The number of chemicals predicted to have both AR effects
+cat('The number of chemicals predicted to have both AR effects:\n',nrow(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==1]))
+
+# The number of AR antagonists-only
+cat('The number of AR antagonists-only:\n',nrow(screening_chems_DT[(CoMPARA_Ago_pred==0 | is.na(CoMPARA_Ago_pred)) & CoMPARA_Anta_pred==1]))
+
+# The number of the AR active clusters
+cat('The number of the AR active clusters:\n',length(unique(screening_chems_DT[CoMPARA_Ago_pred==1 | CoMPARA_Anta_pred==1 | (is.na(CoMPARA_Ago_pred) & CoMPARA_Anta_pred==1),cluster_id])))
+length(screening_chems_DT[CoMPARA_Ago_pred==1 | CoMPARA_Anta_pred==1,cluster_id])
+
+# The number of AR agonist containing clusters:
+cat('The number of AR agonist containing clusters:\n',length(unique(screening_chems_DT[CoMPARA_Ago_pred==1,cluster_id])))
+EDSP_agon_clst = unique(screening_chems_DT[CoMPARA_Ago_pred==1,cluster_id])
+length(EDSP_agon_clst)
+print(EDSP_agon_clst)
+nrow(screening_chems_DT[CoMPARA_Ago_pred==1])
+
+length(screening_chems_DT[cluster_id %in% EDSP_agon_clst,DTXSID])
+length(unique(screening_chems_DT[cluster_id %in% EDSP_agon_clst,DTXSID]))
+
+cat('The number of chemicals in the AR agonist containing cluster:\n',length(unique(screening_chems_DT[cluster_id %in% EDSP_agon_clst,DTXSID])))
+
+length(unique(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==1,cluster_id]))
+nrow(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==1])
+
+length(unique(screening_chems_DT[(CoMPARA_Ago_pred==0 | is.na(CoMPARA_Ago_pred)) & CoMPARA_Anta_pred==1,cluster_id]))
+nrow(screening_chems_DT[(CoMPARA_Ago_pred==0 | is.na(CoMPARA_Ago_pred)) & CoMPARA_Anta_pred==1])
+
+sum(unique(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==0,cluster_id]) %in% unique(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==1,cluster_id]))
+
+sum(unique(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==1,cluster_id]) %in% unique(screening_chems_DT[(CoMPARA_Ago_pred==0 | is.na(CoMPARA_Ago_pred)) & CoMPARA_Anta_pred==1,cluster_id]))
+
+length(unique(screening_chems_DT[CoMPARA_Ago_pred==1 & CoMPARA_Anta_pred==1,cluster_id]))
+
+length(unique(screening_chems_DT[CoMPARA_Ago_pred==1,DTXSID]))
+length(unique(screening_chems_DT[CoMPARA_Ago_pred==1,cluster_id]))
+clust_id_agon = unique(screening_chems_DT[CoMPARA_Ago_pred==1,cluster_id])
+chems_in_agon_clust = unique(screening_chems_DT[cluster_id %in% clust_id_agon,DTXSID])
+length(chems_in_agon_clust)
+
+scr = screening_chems_DT[(DTXSID %in% chems_in_agon_clust),DTXSID]
+
+C = CoMPARA[,.(MoleculeID,CoMPARA_Ago_exp,CoMPARA_Ago_pred,CoMPARA_Anta_exp,CoMPARA_Anta_pred)]
+
+C_edsp = merge(C,edsp[,.(DTXSID,CASRN,cluster_id)],by.x = 'MoleculeID',by.y = 'DTXSID')
+
+C_edsp = C_edsp[MoleculeID %in% scr]
+
+length(unique(edsp$DTXSID))
+
+length(unique(C_edsp$cluster_id))
+
+length(unique(C_edsp[CoMPARA_Ago_pred==1, cluster_id]))
+agon_clst = unique(C_edsp[CoMPARA_Ago_pred==1, cluster_id])
+length(unique(C_edsp[CoMPARA_Ago_pred==1, MoleculeID]))
+length(unique(C_edsp[cluster_id %in% agon_clst, MoleculeID]))
+
+length(unique(C_edsp[CoMPARA_Ago_pred!=1, cluster_id]))
+length(unique(C_edsp[CoMPARA_Ago_pred!=1, MoleculeID]))
+
+head(C_edsp[is.na(CoMPARA_Ago_pred)])
+
+C_edsp[,pct_agon_only:=100*sum(CoMPARA_Ago_pred)/.N,by=cluster_id]
+C_edsp[,tot_agon_clst:=sum(CoMPARA_Ago_pred),by=cluster_id]
+
+C_edsp[,frct_agon_only:=paste(sum(CoMPARA_Ago_pred),"/",.N),by=cluster_id]
+
+AGON_ONLY_cmp = unique(C_edsp[CoMPARA_Ago_pred==1 & !(is.na(pct_agon_only)), .(cluster_id,pct_agon_only,frct_agon_only,tot_agon_clst)])
+
+AGON_ONLY_cmp[,cluster_id:=factor(cluster_id)]
+
+AGON_ONLY_cmp
+
+AGON_ONLY_cmp[tot_agon_clst==1,sum(tot_agon_clst)]
+AGON_ONLY_cmp[tot_agon_clst==1,sum(tot_agon_clst)]
+AGON_ONLY_cmp[tot_agon_clst!=1,sum(tot_agon_clst)]
+
+p = ggplot(data=AGON_ONLY_cmp, aes(x=cluster_id, y=pct_agon_only)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  #scale_fill_brewer(palette="Paired")+ 
+  ggtitle("Percentage of agonists in associated clusters") +
+  xlab("Cluster ID") + ylab("Percentage of agonists")+
+  geom_text(aes(label=frct_agon_only), vjust=1.5, color= 'white', size=2.5)+
+  theme_minimal()
+p = p
+p
+pdf(paste0(figures,"/02/Figure 7 - CoMPARA agonists.pdf"),width = 16, height = 9)
+    p
+    dev.off()
+
+# 1. What information compara provides
+
+# We can get experimantal and predicted values for agonist and antagonist effects:
+C_edsp
+
+# Agonist experimental
+
+unique(C_edsp[,CoMPARA_Ago_exp])
+
+# In these clusters we need 9 assay model
+agon_exp_clust = C_edsp[grepl('Active',CoMPARA_Ago_exp),cluster_id]
+print(agon_exp_clust)
+
+length(unique(C_edsp$MoleculeID))
+
+#Agonia[,agon:=ifelse(CoMPARA_Ago_exp %in% c('Active(weak)','Active(strong)','Active(very weak)') | CoMPARA_Ago_pred==1,1,0)]
+
+# These chemicals are known to be inactive agonist
+
+print(C_edsp[CoMPARA_Ago_exp == 'Inactive',.(MoleculeID,CASRN,cluster_id)])
+
+# Agonist predictions
+
+unique(C_edsp[,CoMPARA_Ago_pred])
+
+agon_pred_clust = unique(C_edsp[CoMPARA_Ago_pred==1,cluster_id])
+print(agon_pred_clust)
+
+Agonia = C_edsp[cluster_id %in% agon_pred_clust]
+Agonia
+
+Agonia[cluster_id==90]
+
+Agonia[,n_chem:=.N,by=cluster_id]
+
+Agonia[,n_agonists:=sum(CoMPARA_Ago_pred, na.rm = TRUE),by=cluster_id]
+
+print(unique(Agonia[,.(cluster_id,n_chem,n_agonists)]))
+
+Agonia[,Percentage:=100.0*n_agonists/n_chem]
+
+write.csv((unique(Agonia[order(-Percentage,-n_chem,-n_agonists),.(cluster_id,n_chem,n_agonists,Percentage)])),paste0(output,'/Compara_agonist_clusters.csv'))
+
+# These are clusters where at least one AR agonist is present
+
+agon_comp = sort(unique(c(agon_exp_clust,agon_pred_clust)))
+print(agon_comp)
+100*length(agon_comp)/length(unique(edsp$cluster_id)) # 9% of the clusters
+
+# Antagonist experimental
+
+unique(C_edsp[,CoMPARA_Anta_exp])
+
+# In these we may use 5-assays
+anta_exp_clust = C_edsp[grepl('Active',CoMPARA_Anta_exp),cluster_id]
+print(anta_exp_clust)
+
+# Antagonist predictions
+
+unique(C_edsp[,CoMPARA_Anta_pred])
+
+anta_pred_clust = sort(unique(C_edsp[CoMPARA_Anta_pred==1,cluster_id]))
+print(anta_pred_clust)
+
+anta_comp = sort(unique(c(anta_exp_clust,anta_pred_clust)))
+
+# On these clusters we need 9-assay model
+agon_in_antagon = agon_comp[agon_comp %in% anta_comp]
+print(agon_in_antagon)
+
+# On these we can run 5-assay model
+submodel5 = anta_comp[!(anta_comp %in% agon_in_antagon)]
+print(length(submodel5))
+print(submodel5)
+
+100*length(submodel5)/length(unique(edsp$cluster_id))
+
+length(unique(edsp$cluster_id))
+
+C_edsp
+```
+
+```{r}
+# Also, I updated the code by:
+# 1. Removing some chemiclas from "screening_chems" due to step 8 and 10 (Figure 1 in the manuscipt).
+# 2. Removing from positive in Tier-A in input of Tier-B. No need to test chemicals twice.
+
+CoMPARA = fread(paste0(input,'/EDSP_DTXSID-txt_OPERA2.7Pred_CoMPARA.csv'))
+volatility <- readr::read_tsv(paste0(input,"/volatility_bins_for_edsp_substances_no_mixtures.tsv"))
+
+chem_info <- volatility %>% 
+  filter(volatility %in% c("Slight", "None")) %>% 
+  inner_join(CoMPARA, by = c("DTXSID" = "MoleculeID"))
+
+screening_chems <- chem_info %>% 
+  select(DTXSID, PREFERRED_NAME, CASRN, cluster_id, CoMPARA_Ago_pred, CoMPARA_Anta_pred)
+
+screening_chems = screening_chems %>% drop_na(CoMPARA_Anta_pred) #ta: CoMPARA returns NaN for both agonist and antagonist prediction for DTXSID2044688 and DTXSID00893611
+
+hit_table <- function(hit_summary){
+  hit_summary %>% 
+    filter(!is.na(CoMPARA_Ago_pred)) %>% 
+    group_by(CoMPARA_Ago_pred) %>% 
+    summarise(chem_count = sum(n)) %>% 
+    arrange(desc(CoMPARA_Ago_pred)) %>% 
+    pivot_wider(names_from = CoMPARA_Ago_pred, names_prefix = "Agonist_", values_from = chem_count) %>% 
+    rename(TP = Agonist_1, FP = Agonist_0)
+}
+
+miss_table <- function(miss_summary){
+  miss_summary %>% 
+    filter(!is.na(CoMPARA_Ago_pred)) %>% 
+    group_by(CoMPARA_Ago_pred) %>% 
+    summarise(chem_count = sum(n)) %>% 
+    arrange(CoMPARA_Ago_pred) %>% 
+    pivot_wider(names_from = CoMPARA_Ago_pred, names_prefix = "Agonist_", values_from = chem_count) %>% 
+    rename(TN = Agonist_0, FN = Agonist_1)
+}
+
+merge_tables <- function(hits, misses){
+  cbind(hits, misses) %>% 
+    mutate(screened = TP+FP+TN+FN, FDR = FP/(TP+FP), NPV = TN/(TN+FN))
+}
+
+screening_simulation_ta <- function(screening_chems, sens, spc, type = "agonists"){
+    
+    # This function simulates positive predictions during screening
+    
+    if('active_pred' %in% colnames(screening_chems)){
+        
+        # This branch investigates second tier screen (Tier-B).
+        
+        if(type == "agonists"){
+            
+            # Select clusters with potential agonists and remove previously screened chemicals
+            screening_chems = screening_chems %>% filter(cluster_flagged == 1 & active_pred == 0)
+            
+            # Remove "cluster_flagged" and "active_pred" columns
+            screening_chems = screening_chems %>% select (-c(cluster_flagged, active_pred))
+            
+            # Now, the analysis is the same as in Tier-A
+            pos_chems <- screening_chems %>%
+            filter(CoMPARA_Ago_pred == 1) %>% 
+            select(DTXSID, cluster_id)         # 1. select positive agonist chemicals and their coresponding cluster IDs
+            neg_chems <- screening_chems %>% 
+            filter(CoMPARA_Ago_pred == 0) %>% 
+            select(DTXSID, cluster_id)         # 2. select negative agonist chemicals and their coresponding cluster IDs
+            
+        }else if(type == "antagonists"){
+            
+            # Select clusters with potential agonists and remove previously screened chemicals
+            screening_chems = screening_chems %>% filter(cluster_flagged == 1 & active_pred == 0)
+            
+            # Remove "cluster_flagged" and "active_pred" columns
+            screening_chems = screening_chems %>% select (-c(cluster_flagged, active_pred))
+
+            # Now, the analysis is the same as in Tier-A
+            pos_chems <- screening_chems %>%
+            filter(CoMPARA_Anta_pred == 1) %>%
+            select(DTXSID, cluster_id)         # 1. select positive antagonist chemicals and their coresponding cluster IDs
+            neg_chems <- screening_chems %>% 
+            filter(CoMPARA_Anta_pred == 0) %>% 
+            select(DTXSID, cluster_id)         # 2. select negative antagonist chemicals and their coresponding cluster IDs
+            
+        }else{
+            stop("Type must be either 'agonists' or 'antagonists'.")
+        }
+        
+        pos_pred <- slice_sample(pos_chems, prop = sens)
+        neg_pred <- slice_sample(neg_chems, prop = 1-spc)
+       
+        clust_pred <- screening_chems %>% 
+        filter(cluster_id %in% unique(c(pos_pred$cluster_id, neg_pred$cluster_id))) %>% # select clusters
+        mutate(cluster_flagged = 1,                                                     # assign 1 to clusters that are in pos_pred and neg_pred
+               active_pred = if_else(DTXSID %in% c(pos_pred$DTXSID, neg_pred$DTXSID), 1, 0)) # assign 1 to all DTXSIDs that are explicitly selected (in "pos_pred" and "neg_pred" sample)
+        
+    }else{
+        
+        # This branch investigates the first tier screen (Tier-A).
+        
+        if(type == "agonists"){
+            pos_chems <- screening_chems %>%
+            filter(CoMPARA_Ago_pred == 1) %>% 
+            select(DTXSID, cluster_id)         # 1. select positive agonist chemicals and their coresponding cluster IDs
+            neg_chems <- screening_chems %>% 
+            filter(CoMPARA_Ago_pred == 0) %>% 
+            select(DTXSID, cluster_id)         # 2. select negative agonist chemicals and their coresponding cluster IDs
+        }else if(type == "antagonists"){
+            pos_chems <- screening_chems %>%
+            filter(CoMPARA_Anta_pred == 1) %>%
+            select(DTXSID, cluster_id)         # 1. select positive antagonist chemicals and their coresponding cluster IDs
+            neg_chems <- screening_chems %>% 
+            filter(CoMPARA_Anta_pred == 0) %>% 
+            select(DTXSID, cluster_id)         # 2. select negative antagonist chemicals and their coresponding cluster IDs
+        }else{
+            stop("Type must be either 'agonists' or 'antagonists'.")
+        }
+        
+        pos_pred <- slice_sample(pos_chems, prop = sens) # This assumes that randomly "sens" fraction of agonists are detected, ie. TP
+        neg_pred <- slice_sample(neg_chems, prop = 1-spc) # This grabs FP. The subset model will identify "spc" fraction of negatives. However, the model will mistakenly identify "1-spc" fraction of negative molecules as positive.
+        
+        clust_pred <- screening_chems %>% 
+        filter(cluster_id %in% unique(c(pos_pred$cluster_id, neg_pred$cluster_id))) %>% # select clusters
+        mutate(cluster_flagged = 1,                                                     # assign 1 to clusters that are in pos_pred and neg_pred
+               active_pred = if_else(DTXSID %in% c(pos_pred$DTXSID, neg_pred$DTXSID), 1, 0)) # assign 1 to all DTXSIDs that are explicitly selected (in "pos_pred" and "neg_pred" sample), i.e these are actives
+    }
+    return(clust_pred)
+}
+
+negatives <- function(screening_chems, sens, spc, type = "antagonists"){
+  if (type == "agonists"){
+    pos_chems <- screening_chems %>% 
+      filter(CoMPARA_Ago_pred == 1) %>% 
+      select(DTXSID, cluster_id)
+    neg_chems <- screening_chems %>% 
+      filter(CoMPARA_Ago_pred == 0) %>% 
+      select(DTXSID, cluster_id)
+  }else if (type == "antagonists"){
+    pos_chems <- screening_chems %>% 
+      filter(CoMPARA_Anta_pred == 1) %>% 
+      select(DTXSID, cluster_id)
+    neg_chems <- screening_chems %>% 
+      filter(CoMPARA_Anta_pred == 0) %>% 
+      select(DTXSID, cluster_id)
+  }else{
+    stop("Type must be either 'agonists' or 'antagonists'.")
+  }
+  pos_pred <- slice_sample(pos_chems, prop = 1-sens) # Grab portion of positives identified as FN
+  neg_pred <- slice_sample(neg_chems, prop = spc) # Grab TN
+  clust_pred <- screening_chems %>% 
+    filter(cluster_id %in% unique(c(pos_pred$cluster_id, neg_pred$cluster_id))) %>% 
+    mutate(cluster_flagged = 1,
+      active_pred = if_else(DTXSID %in% c(pos_pred$DTXSID, neg_pred$DTXSID), 1, 0))
+    return(clust_pred %>% filter(cluster_flagged == 1 & active_pred == 1))
+}
+
+#type <-  "agonists"; sens <- 0.714; spc <- 0.979; 
+#type <-  "agonists"; sens <- 0.964; spc <- 0.977;
+#type <-  "antagonists"; sens <- 0.952; spc <- 0.934; 
+#type <-  "antagonists"; sens <- 0.952; spc <- 0.959;
+total_summary <- data.frame()
+a_summary <- data.frame()
+a_cluster_summary <- data.frame()
+b_summary <- data.frame()
+
+# EDSP substances to screen
+nrow(screening_chems)
+
+# In Step 8, 361 chemicals were moved to step 9. The remaining goes to step 10.
+#screening_chems = screening_chems %>% filter(!(cluster_id %in% clust_id_agon))
+
+# Now, this goes to step 10
+nrow(screening_chems)
+
+# This is a subset model used in step 10
+#unique(ALL_vs_FULL[submodel.x=='A00001000001111',.(sens.Antagonist.allchem,spec.Antagonist.allchem)])
+
+set.seed(42)
+#step_10_negatives = list()
+for (i in 1:1000){
+    # Get negatives in step 10 and save them to "step_10".
+    #step_10 = negatives(screening_chems, sens = 0.952, spc = 0.934, type='antagonists') # Mark negatives as 1 in "active_pred". Step 10 uses 'A00001000001111' subset model for agonist screening
+    #step_10_negatives[i] = sum(step_10$active_pred==1)
+    #step_10 = step_10 %>% select (-c(cluster_flagged, active_pred)) # remove columns
+    # Continue toward 2-tier approach
+  #tier_a <- screening_simulation_ta(step_10, sens = 0.714, spc = 0.979) # this will mark "active_pred" column as 1 for 180 DTXSIDs, and all cluster_flagged will be 1 in which those chemicals reside; 133*0.714=94 agonist positives (TP), and 4100*(1-0.979) = 86 agonist negatives (FP) 
+    tier_a <- screening_simulation_ta(screening_chems, sens = 0.714, spc = 0.98)
+    tier_b <- screening_simulation_ta(tier_a, sens = 0.964, spc = 0.977) # 29*0.964 + 804*(1-0.977) = 27 + 18 ~ 45
+    
+  screening_results <- screening_chems %>% 
+    left_join(tier_a, by = c("DTXSID", "PREFERRED_NAME", "CASRN", "cluster_id", "CoMPARA_Ago_pred", "CoMPARA_Anta_pred")) %>% 
+    mutate(tier_a_cluster = if_else(is.na(cluster_flagged), 0, cluster_flagged), 
+           tier_a_active = if_else(is.na(active_pred), 0, active_pred), .keep = "unused") %>% 
+    left_join(tier_b, by = c("DTXSID", "PREFERRED_NAME", "CASRN", "cluster_id", "CoMPARA_Ago_pred", "CoMPARA_Anta_pred")) %>% 
+    mutate(tier_b_cluster = if_else(is.na(cluster_flagged), 0, cluster_flagged), tier_b_active = active_pred, .keep = "unused") %>% 
+    mutate(tier_b_active = if_else(is.na(tier_b_active), if_else(tier_a_cluster == 1, 0, tier_b_active), tier_b_active))
+  
+  screening_summary <- screening_results %>% 
+    group_by(CoMPARA_Ago_pred, tier_a_cluster, tier_a_active, tier_b_cluster, tier_b_active) %>% 
+    count()
+  
+  total_hits <- screening_summary %>% 
+    filter(tier_a_active == 1 | tier_b_active == 1) %>% 
+    hit_table()
+  
+  total_misses <- screening_summary %>% 
+    filter(tier_a_active == 0 & (is.na(tier_b_active) | tier_b_active == 0)) %>% 
+    miss_table()
+  
+  total_summary <- rbind(total_summary, merge_tables(total_hits, total_misses))
+  
+  a_hits <- screening_summary %>% 
+    filter(tier_a_active == 1) %>% 
+    hit_table()
+  
+  a_misses <- screening_summary %>% 
+    filter(tier_a_active == 0) %>% 
+    miss_table()
+  
+  a_summary <- rbind(a_summary, merge_tables(a_hits, a_misses))
+  
+  a_clusters_h <- screening_summary %>% 
+    filter(tier_a_cluster == 1) %>% 
+    hit_table()
+  
+  a_clusters_m <- screening_summary %>% 
+    filter(tier_a_cluster == 0) %>% 
+    miss_table()
+  
+  a_cluster_summary <- rbind(a_cluster_summary, merge_tables(a_clusters_h, a_clusters_m))
+  
+  b_hits <- screening_summary %>% 
+    filter(tier_b_active == 1) %>% 
+    hit_table()
+  
+  b_misses <- screening_summary %>% 
+    filter(tier_b_active == 0) %>% 
+    miss_table()
+  
+  b_summary <- rbind(b_summary, merge_tables(b_hits, b_misses))
+}
+
+total_summary
+a_summary
+a_cluster_summary
+b_summary
+```
+
+```{r}
+total_summary_se
+a_summary_se
+a_cluster_summary_se
+b_summary_se
+```
