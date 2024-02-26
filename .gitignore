@@ -1,0 +1,25 @@
+#Ignore data directories by default 
+#Comment lines if you want to version data files but only for small files
+#inputs/*
+outputs/*
+figures/*
+
+#Don't store .DS_Store files in version control
+.DS_Store
+
+#Don't store db info in version control
+dbconfig.yml
+
+#Ignore "core" files from Linux
+core.*
+
+#Ignore RStudio Files
+*.Rproj
+.Rproj.user
+.Rhistory
+.RData
+
+#Ignore emacs backup files
+*~
+#*
+.#*
